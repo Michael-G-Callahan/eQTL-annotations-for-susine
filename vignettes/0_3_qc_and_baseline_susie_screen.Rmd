@@ -1,0 +1,536 @@
+---
+title: "0.3 QC and Baseline SuSiE Screen"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+This workbook performs a hard-QC pass over the Phase 1 GTEx Lung locus screen,
+then writes a Slurm task manifest for vanilla `susieR::susie_rss()` baseline
+screening. It does not use AlphaGenome annotations and does not run the full
+baseline screen inside the workbook.
+
+```{r setup, message=FALSE}
+required_packages <- c("arrow", "dplyr", "ggplot2", "readr", "tibble", "tidyr", "purrr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this workbook."
+  )
+}
+
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(tidyr)
+library(purrr)
+```
+
+# 1. Configuration
+
+```{r config}
+find_project_root <- function(start = getwd()) {
+  # Example fallback path -- set to your environment (or set EQTL_SUSINE_PROJECT_ROOT).
+  hardcoded <- "/path/to/eQTL_annotations_for_susine"
+  env_root <- Sys.getenv("EQTL_SUSINE_PROJECT_ROOT", unset = "")
+  candidates <- unique(c(
+    env_root,
+    hardcoded,
+    normalizePath(start, winslash = "/", mustWork = FALSE),
+    dirname(normalizePath(start, winslash = "/", mustWork = FALSE)),
+    dirname(dirname(normalizePath(start, winslash = "/", mustWork = FALSE)))
+  ))
+  candidates <- candidates[nzchar(candidates)]
+  for (candidate in candidates) {
+    if (
+      dir.exists(file.path(candidate, "utils")) &&
+      dir.exists(file.path(candidate, "vignettes")) &&
+      file.exists(file.path(candidate, "README.md"))
+    ) {
+      return(normalizePath(candidate, winslash = "/", mustWork = TRUE))
+    }
+  }
+  stop("Could not locate eQTL_annotations_for_susine project root.")
+}
+
+PROJECT_ROOT <- find_project_root()
+
+MANIFEST_PATH <- file.path(PROJECT_ROOT, "config", "loci_manifest_sample_100_per_chrom.csv")
+PHASE1_METRICS_CANDIDATES <- c(
+  file.path(PROJECT_ROOT, "output", "prelim", "loci_manifest_sample_100_per_chrom_phase1_dataset_metrics.csv"),
+  file.path(PROJECT_ROOT, "output", "prelim", "phase1_dataset_metrics_all_loci.csv")
+)
+PHASE1_METRICS_PATH <- PHASE1_METRICS_CANDIDATES[file.exists(PHASE1_METRICS_CANDIDATES)][1]
+if (is.na(PHASE1_METRICS_PATH)) {
+  stop(
+    "Could not find a Phase 1 metrics CSV. Checked:\n",
+    paste(PHASE1_METRICS_CANDIDATES, collapse = "\n")
+  )
+}
+
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+LD_DIR <- file.path(OUTPUT_DIR, "ld")
+SCREEN_DIR <- file.path(OUTPUT_DIR, "prelim", "baseline_susie_screen")
+TASK_OUTPUT_ROOT <- file.path(OUTPUT_DIR, "baseline_susie_screen", "task_outputs")
+SLURM_SCRIPT_DIR <- file.path(OUTPUT_DIR, "slurm_scripts")
+SLURM_PRINTS_DIR <- file.path(OUTPUT_DIR, "slurm_prints")
+RUN_TASK_SCRIPT <- file.path(PROJECT_ROOT, "scripts", "run_baseline_susie_screen_task.R")
+RUN_PHASE1_TASK_SCRIPT <- file.path(PROJECT_ROOT, "scripts", "run_phase1_task.py")
+
+dir.create(SCREEN_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TASK_OUTPUT_ROOT, recursive = TRUE, showWarnings = FALSE)
+dir.create(SLURM_SCRIPT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(SLURM_PRINTS_DIR, recursive = TRUE, showWarnings = FALSE)
+
+QC_RECONSTRUCT_LD <- TRUE
+MAX_VARIANTS_FOR_SUSIE <- Inf
+TASK_LIMIT <- Inf
+ALLOW_BASELINE_WITH_MISSING_PHASE1_ARTIFACTS <- FALSE
+
+SUSIE_L <- 10L
+ACTIVE_ALPHA_MAX_THRESHOLD <- 0.01
+
+JOB_NAME <- "baseline_susie_screen"
+TIME_LIMIT <- "03:00:00"
+MEMORY <- "10G"
+CPUS_PER_TASK <- 1L
+ACCOUNT <- "your_slurm_account"  # example -- set to your environment
+MAIL_USER <- "you@example.com"  # example -- set to your environment
+MAIL_TYPE <- "BEGIN,END,FAIL"
+LOAD_R_MODULE <- TRUE
+R_LIBS_USER <- "~/R/x86_64-pc-linux-gnu-library/4.3"  # example -- set to your environment
+PYTHON_BIN <- "python"
+
+QC_TABLE_PATH <- file.path(SCREEN_DIR, "qc_locus_table.csv")
+TASK_MANIFEST_PATH <- file.path(SCREEN_DIR, "baseline_susie_task_manifest.csv")
+SLURM_SCRIPT_PATH <- file.path(SLURM_SCRIPT_DIR, "baseline_susie_screen.slurm")
+PHASE1_MATERIALIZATION_MANIFEST_PATH <- file.path(SCREEN_DIR, "baseline_susie_missing_phase1_artifacts_manifest.csv")
+PHASE1_MATERIALIZATION_SLURM_PATH <- file.path(SLURM_SCRIPT_DIR, "baseline_susie_materialize_phase1_artifacts.slurm")
+
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("Manifest:", MANIFEST_PATH, "\n")
+cat("Phase 1 metrics:", PHASE1_METRICS_PATH, "\n")
+cat("Screen dir:", SCREEN_DIR, "\n")
+cat("Task script:", RUN_TASK_SCRIPT, "\n")
+```
+
+# 2. QC Helpers
+
+```{r helpers}
+accept_phase1_status <- function(status) {
+  status %in% c("completed", "skipped_existing")
+}
+
+required_input_paths <- function(locus_id, gene_name) {
+  locus_dir <- file.path(LD_DIR, locus_id)
+  tibble(
+    master_path = file.path(locus_dir, sprintf("%s_phase1_master_variants.csv", gene_name)),
+    order_path = file.path(locus_dir, sprintf("%s_LD_variant_order.tsv", gene_name)),
+    ld_long_path = file.path(locus_dir, sprintf("%s_phase1_LD_R_long.parquet", gene_name))
+  )
+}
+
+coalesce_path <- function(primary, fallback) {
+  primary <- as.character(primary)
+  if (length(primary) == 0 || is.na(primary[[1]]) || !nzchar(primary[[1]])) fallback else primary[[1]]
+}
+
+row_value <- function(row, name) {
+  if (name %in% names(row)) row[[name]] else NA_character_
+}
+
+phase1_input_paths <- function(row) {
+  fallback <- required_input_paths(row$locus_id[[1]], row$gene_name[[1]])
+  tibble(
+    master_path = coalesce_path(row_value(row, "phase1_master_variants_csv"), fallback$master_path[[1]]),
+    order_path = coalesce_path(row_value(row, "ld_variant_order_tsv"), fallback$order_path[[1]]),
+    ld_long_path = coalesce_path(row_value(row, "phase1_ld_long_parquet"), fallback$ld_long_path[[1]])
+  )
+}
+
+append_issue <- function(issues, condition, label) {
+  if (isTRUE(condition)) c(issues, label) else issues
+}
+
+qc_one_locus <- function(row) {
+  locus_id <- row$locus_id[[1]]
+  gene_name <- row$gene_name[[1]]
+  phase1_status <- if ("status" %in% names(row)) row$status[[1]] else NA_character_
+  n_variants_raw <- if ("phase1_master_variants" %in% names(row)) {
+    row$phase1_master_variants[[1]]
+  } else {
+    NA_integer_
+  }
+  paths <- phase1_input_paths(row)
+  issues <- character()
+
+  issues <- append_issue(issues, !accept_phase1_status(phase1_status), "bad_phase1_status")
+  issues <- append_issue(issues, !file.exists(paths$master_path[[1]]), "missing_master")
+  issues <- append_issue(issues, !file.exists(paths$order_path[[1]]), "missing_order")
+  issues <- append_issue(issues, !file.exists(paths$ld_long_path[[1]]), "missing_ld_long")
+
+  n_variants <- suppressWarnings(as.integer(n_variants_raw))
+  issues <- append_issue(issues, is.na(n_variants) || n_variants < 1L, "no_phase1_master_variants")
+  issues <- append_issue(
+    issues,
+    is.finite(MAX_VARIANTS_FOR_SUSIE) && !is.na(n_variants) && n_variants > MAX_VARIANTS_FOR_SUSIE,
+    "too_large_for_baseline_susie"
+  )
+
+  n_rss <- NA_integer_
+  deep_error <- NA_character_
+
+  if (length(issues) == 0 && isTRUE(QC_RECONSTRUCT_LD)) {
+    tryCatch({
+      master_df <- readr::read_csv(paths$master_path[[1]], show_col_types = FALSE)
+      if ("ld_included" %in% names(master_df)) {
+        master_df <- master_df %>% dplyr::filter(.data$ld_included)
+      }
+      master_df <- master_df %>%
+        dplyr::transmute(
+          variant_id = as.character(.data$variant_id),
+          z_score = as.numeric(.data$z_score),
+          sample_size = as.numeric(.data$sample_size)
+        )
+
+      order_df <- readr::read_tsv(paths$order_path[[1]], show_col_types = FALSE) %>%
+        dplyr::mutate(index = as.integer(.data$index), id = as.character(.data$id)) %>%
+        dplyr::arrange(.data$index)
+
+      aligned_df <- order_df %>%
+        dplyr::left_join(master_df, by = c("id" = "variant_id")) %>%
+        dplyr::arrange(.data$index)
+      p <- nrow(aligned_df)
+
+      issues <<- append_issue(issues, p < 1L, "no_aligned_variants")
+      issues <<- append_issue(issues, !all(aligned_df$index == seq_len(p) - 1L), "noncontiguous_ld_order")
+      issues <<- append_issue(issues, any(is.na(aligned_df$z_score)), "missing_aligned_z")
+      issues <<- append_issue(issues, any(!is.finite(aligned_df$z_score)), "nonfinite_aligned_z")
+      issues <<- append_issue(
+        issues,
+        any(is.na(aligned_df$sample_size)) || any(!is.finite(aligned_df$sample_size)),
+        "invalid_sample_size"
+      )
+      issues <<- append_issue(issues, any(aligned_df$sample_size <= 2, na.rm = TRUE), "sample_size_le_2")
+
+      ld_long_df <- arrow::read_parquet(paths$ld_long_path[[1]]) %>% tibble::as_tibble()
+      expected_pairs <- p * (p - 1) / 2
+      issues <<- append_issue(issues, nrow(ld_long_df) != expected_pairs, "ld_pair_count_mismatch")
+      issues <<- append_issue(
+        issues,
+        any(!is.finite(as.numeric(ld_long_df$r))),
+        "nonfinite_ld_r"
+      )
+      issues <<- append_issue(
+        issues,
+        any(ld_long_df$snp_index_1 < 0 | ld_long_df$snp_index_1 >= p |
+              ld_long_df$snp_index_2 < 0 | ld_long_df$snp_index_2 >= p, na.rm = TRUE),
+        "ld_index_out_of_range"
+      )
+
+      n_rss <<- round(mean(aligned_df$sample_size, na.rm = TRUE))
+    }, error = function(e) {
+      issues <<- c(issues, "deep_qc_error")
+      deep_error <<- conditionMessage(e)
+    })
+  }
+
+  qc_status <- if (length(issues) == 0) "qc_pass" else "qc_fail"
+  dplyr::bind_cols(
+    row,
+    paths,
+    tibble(
+      n_variants = n_variants,
+      n_rss_qc = n_rss,
+      qc_status = qc_status,
+      qc_issue_count = length(issues),
+      qc_issues = if (length(issues)) paste(issues, collapse = ";") else NA_character_,
+      qc_error_message = deep_error
+    )
+  )
+}
+```
+
+# 3. Load Phase 1 Screen
+
+```{r load-phase1}
+manifest_df <- readr::read_csv(MANIFEST_PATH, show_col_types = FALSE)
+phase1_df <- readr::read_csv(PHASE1_METRICS_PATH, show_col_types = FALSE)
+manifest_required_cols <- c(
+  "locus_id", "gene_name", "gene_id", "gene_type",
+  "gtex_tissue", "gtex_chrom", "enabled"
+)
+missing_manifest_cols <- setdiff(manifest_required_cols, names(manifest_df))
+if (length(missing_manifest_cols)) {
+  stop("Manifest is missing required columns: ", paste(missing_manifest_cols, collapse = ", "))
+}
+
+screen_source_df <- manifest_df %>%
+  dplyr::left_join(
+    phase1_df,
+    by = c("locus_id", "gene_name", "gene_id", "gtex_tissue", "gtex_chrom")
+  ) %>%
+  dplyr::filter(isTRUE(.data$enabled) | .data$enabled %in% c(TRUE, "True", "TRUE", 1L))
+
+cat("Enabled manifest loci:", nrow(screen_source_df), "\n")
+cat("Phase 1 rows:", nrow(phase1_df), "\n")
+```
+
+# 4. Run Hard QC
+
+```{r qc-pass}
+qc_locus_table <- purrr::map_dfr(seq_len(nrow(screen_source_df)), function(i) {
+  if (i %% 25L == 0L || i == nrow(screen_source_df)) {
+    cat("QC locus", i, "of", nrow(screen_source_df), "\n")
+  }
+  qc_one_locus(screen_source_df[i, , drop = FALSE])
+})
+
+readr::write_csv(qc_locus_table, QC_TABLE_PATH)
+
+qc_locus_table %>%
+  dplyr::count(.data$qc_status, .data$qc_issues, sort = TRUE)
+```
+
+```{r qc-summary}
+stopifnot(nrow(qc_locus_table) == nrow(screen_source_df))
+stopifnot(!anyDuplicated(qc_locus_table$locus_id))
+
+qc_locus_table %>%
+  dplyr::count(.data$qc_status)
+
+artifact_missing_loci <- qc_locus_table %>%
+  dplyr::mutate(
+    missing_master_file = !file.exists(.data$master_path),
+    missing_order_file = !file.exists(.data$order_path),
+    missing_ld_long_file = !file.exists(.data$ld_long_path),
+    missing_any_phase1_artifact = .data$missing_master_file | .data$missing_order_file | .data$missing_ld_long_file,
+    recoverable_missing_phase1_artifacts =
+      accept_phase1_status(.data$status) &
+      !is.na(.data$n_variants) &
+      .data$n_variants > 0L &
+      .data$missing_any_phase1_artifact
+  ) %>%
+  dplyr::filter(.data$recoverable_missing_phase1_artifacts)
+
+if (nrow(artifact_missing_loci) > 0) {
+  materialization_cols <- intersect(names(manifest_df), names(artifact_missing_loci))
+  phase1_materialization_manifest <- artifact_missing_loci %>%
+    dplyr::select(dplyr::all_of(materialization_cols)) %>%
+    dplyr::mutate(enabled = TRUE)
+  readr::write_csv(phase1_materialization_manifest, PHASE1_MATERIALIZATION_MANIFEST_PATH)
+
+  phase1_slurm_text <- sprintf(
+'#!/bin/bash
+#SBATCH --job-name=baseline_susie_phase1_materialize
+#SBATCH --array=1-%d
+#SBATCH --time=%s
+#SBATCH --mem=%s
+#SBATCH --cpus-per-task=%d
+#SBATCH --mail-user=%s
+#SBATCH --mail-type=%s
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
+#SBATCH --account=%s
+
+set -euo pipefail
+
+PROJECT_ROOT="%s"
+MANIFEST_PATH="%s"
+RUN_TASK_SCRIPT="%s"
+SLURM_PRINTS_BASE="%s"
+
+JOBNAME="${SLURM_JOB_NAME}"
+PARENT_ID="${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+PRINTS_DIR="${SLURM_PRINTS_BASE}/${JOBNAME}/${PARENT_ID}"
+mkdir -p "${PRINTS_DIR}"
+
+exec >"${PRINTS_DIR}/${TASK_ID}.out" 2>"${PRINTS_DIR}/${TASK_ID}.err"
+
+echo "[$(date -Is)] Materializing Phase-1 artifacts for task ${TASK_ID}"
+
+%s "${RUN_TASK_SCRIPT}" \\
+  --manifest "${MANIFEST_PATH}" \\
+  --task-id "${TASK_ID}" \\
+  --chunk-size 1 \\
+  --run-mode processing \\
+  --force
+
+echo "[$(date -Is)] Completed Phase-1 materialization task ${TASK_ID}"
+',
+    nrow(phase1_materialization_manifest),
+    TIME_LIMIT,
+    MEMORY,
+    CPUS_PER_TASK,
+    MAIL_USER,
+    MAIL_TYPE,
+    ACCOUNT,
+    PROJECT_ROOT,
+    PHASE1_MATERIALIZATION_MANIFEST_PATH,
+    RUN_PHASE1_TASK_SCRIPT,
+    SLURM_PRINTS_DIR,
+    PYTHON_BIN
+  )
+  writeLines(phase1_slurm_text, PHASE1_MATERIALIZATION_SLURM_PATH)
+
+  cat("Recoverable loci missing Phase-1 z/order/LD artifacts:", nrow(artifact_missing_loci), "\n")
+  cat("Wrote Phase-1 materialization manifest:", PHASE1_MATERIALIZATION_MANIFEST_PATH, "\n")
+  cat("Wrote Phase-1 materialization Slurm script:", PHASE1_MATERIALIZATION_SLURM_PATH, "\n")
+  cat("Submit first with:\n")
+  cat("`sbatch ", PHASE1_MATERIALIZATION_SLURM_PATH, "`\n", sep = "")
+}
+
+if (
+  nrow(artifact_missing_loci) > 0 &&
+  !isTRUE(ALLOW_BASELINE_WITH_MISSING_PHASE1_ARTIFACTS)
+) {
+  stop(
+    "Baseline SuSiE screening needs per-locus Phase-1 artifacts, but ",
+    nrow(artifact_missing_loci),
+    " recoverable loci are missing master/order/LD files. ",
+    "Submit the materialization Slurm script above, then rerun this workbook."
+  )
+}
+```
+
+# 5. Write Baseline SuSiE Task Manifest
+
+```{r task-manifest}
+task_manifest <- qc_locus_table %>%
+  dplyr::filter(.data$qc_status == "qc_pass") %>%
+  dplyr::arrange(.data$gtex_chrom, .data$gene_name, .data$locus_id) %>%
+  dplyr::mutate(
+    task_id = dplyr::row_number(),
+    output_dir = file.path(TASK_OUTPUT_ROOT, .data$locus_id)
+  ) %>%
+  dplyr::select(dplyr::all_of(c(
+    "task_id", "locus_id", "gene_name", "gene_id", "gtex_tissue", "gtex_chrom",
+    "n_variants", "n_rss_qc", "master_path", "order_path", "ld_long_path", "output_dir"
+  )))
+
+if (is.finite(TASK_LIMIT)) {
+  task_manifest <- task_manifest %>% dplyr::slice_head(n = TASK_LIMIT)
+}
+
+readr::write_csv(task_manifest, TASK_MANIFEST_PATH)
+cat("QC-passing task count:", nrow(task_manifest), "\n")
+cat("Task manifest:", TASK_MANIFEST_PATH, "\n")
+task_manifest %>% dplyr::slice_head(n = 10)
+```
+
+# 6. Write Slurm Script
+
+```{r slurm-script, results='asis'}
+if (!file.exists(RUN_TASK_SCRIPT)) {
+  stop("Missing task script: ", RUN_TASK_SCRIPT)
+}
+
+task_count <- nrow(task_manifest)
+if (task_count == 0L) {
+  stop("No QC-passing loci available for baseline SuSiE screening.")
+}
+
+max_variants_arg <- if (is.finite(MAX_VARIANTS_FOR_SUSIE)) {
+  as.character(MAX_VARIANTS_FOR_SUSIE)
+} else {
+  "Inf"
+}
+hpc_setup <- paste(
+  c(
+    if (isTRUE(LOAD_R_MODULE)) "module load r" else character(),
+    if (nzchar(R_LIBS_USER)) sprintf('export R_LIBS_USER="%s"', R_LIBS_USER) else character()
+  ),
+  collapse = "\n"
+)
+
+slurm_text <- sprintf(
+'#!/bin/bash
+#SBATCH --job-name=%s
+#SBATCH --array=1-%d
+#SBATCH --time=%s
+#SBATCH --mem=%s
+#SBATCH --cpus-per-task=%d
+#SBATCH --mail-user=%s
+#SBATCH --mail-type=%s
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
+#SBATCH --account=%s
+
+set -euo pipefail
+
+PROJECT_ROOT="%s"
+TASK_MANIFEST="%s"
+RUN_TASK_SCRIPT="%s"
+SLURM_PRINTS_BASE="%s"
+
+JOBNAME="${SLURM_JOB_NAME}"
+PARENT_ID="${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+PRINTS_DIR="${SLURM_PRINTS_BASE}/${JOBNAME}/${PARENT_ID}"
+mkdir -p "${PRINTS_DIR}"
+
+exec >"${PRINTS_DIR}/${TASK_ID}.out" 2>"${PRINTS_DIR}/${TASK_ID}.err"
+
+echo "[$(date -Is)] Starting task ${TASK_ID} for job ${JOBNAME} (parent ${PARENT_ID})"
+echo "Task manifest: ${TASK_MANIFEST}"
+
+# --- site/module setup ---
+%s
+
+Rscript "${RUN_TASK_SCRIPT}" \\
+  --task-manifest "${TASK_MANIFEST}" \\
+  --task-id "${TASK_ID}" \\
+  --L %d \\
+  --max-variants %s \\
+  --active-alpha-max-threshold %.6f
+
+echo "[$(date -Is)] Completed task ${TASK_ID}"
+',
+  JOB_NAME,
+  task_count,
+  TIME_LIMIT,
+  MEMORY,
+  CPUS_PER_TASK,
+  MAIL_USER,
+  MAIL_TYPE,
+  ACCOUNT,
+  PROJECT_ROOT,
+  TASK_MANIFEST_PATH,
+  RUN_TASK_SCRIPT,
+  SLURM_PRINTS_DIR,
+  hpc_setup,
+  SUSIE_L,
+  max_variants_arg,
+  ACTIVE_ALPHA_MAX_THRESHOLD
+)
+
+writeLines(slurm_text, SLURM_SCRIPT_PATH)
+cat("Wrote Slurm script:", SLURM_SCRIPT_PATH, "\n\n")
+cat("Submit with:\n\n")
+cat("`sbatch ", SLURM_SCRIPT_PATH, "`\n", sep = "")
+```
+
+# 7. Smoke-Test Command
+
+```{r smoke-command, results='asis'}
+cat(
+  "Local/HPC smoke command for the first task:\n\n",
+  "`Rscript ", RUN_TASK_SCRIPT,
+  " --task-manifest ", TASK_MANIFEST_PATH,
+  " --task-id 1 --L ", SUSIE_L,
+  " --max-variants ", max_variants_arg,
+  " --active-alpha-max-threshold ", ACTIVE_ALPHA_MAX_THRESHOLD,
+  "`\n",
+  sep = ""
+)
+```

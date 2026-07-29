@@ -1,0 +1,21 @@
+{
+  "upload_type": "software",
+  "title": "eQTL-annotations-for-susine: Annotation Pipeline for SuSiNE",
+  "description": "Python pipeline generating AlphaGenome-derived eQTL annotations and LD inputs for the SuSiNE real-data analysis.",
+  "creators": [
+    {
+      "name": "Callahan, Michael G.",
+      "orcid": "0009-0007-6532-0995",
+      "affiliation": "Pennsylvania State University"
+    }
+  ],
+  "license": "MIT",
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.21539486",
+      "relation": "isSupplementedBy",
+      "resource_type": "dataset"
+    }
+  ]
+}

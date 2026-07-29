@@ -1,0 +1,14 @@
+data/
+wandb/
+output/*
+!output/README.md
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Notebook-local noise
+.ipynb_checkpoints/
+.Rproj.user
+.jupyter_runtime/

@@ -1,0 +1,239 @@
+---
+title: "Validate suSiE RSS on CBX8 Phase 1 Outputs"
+output: html_notebook
+---
+
+```{r setup}
+required_packages <- c("arrow", "dplyr", "ggplot2", "Matrix", "readr", "susieR", "tibble")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(Matrix)
+library(readr)
+library(susieR)
+library(tibble)
+
+find_project_root <- function(start = getwd()) {
+  candidates <- c(normalizePath(start, winslash = "/", mustWork = TRUE), dirname(normalizePath(start, winslash = "/", mustWork = TRUE)))
+  # Example fallback path -- set to your environment.
+  hardcoded <- "/path/to/eQTL_annotations_for_susine"
+  candidates <- c(candidates, dirname(candidates), hardcoded)
+  candidates <- unique(normalizePath(candidates, winslash = "/", mustWork = FALSE))
+
+  for (candidate in candidates) {
+    if (
+      dir.exists(file.path(candidate, "utils")) &&
+      dir.exists(file.path(candidate, "vignettes")) &&
+      file.exists(file.path(candidate, "README.md"))
+    ) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate eQTL_annotations_for_susine project root")
+}
+
+PROJECT_ROOT <- find_project_root()
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+Z_SCORE_DIR <- file.path(OUTPUT_DIR, "z_score")
+LD_DIR <- file.path(OUTPUT_DIR, "ld")
+ANNOTATION_DIR <- file.path(OUTPUT_DIR, "annotation", "alphagenome")
+
+GENE_NAME <- "CBX8"
+MAX_VARIANTS <- NULL
+SUSIE_L <- 10
+
+MASTER_PATH <- file.path(LD_DIR, sprintf("%s_phase1_master_variants.csv", GENE_NAME))
+ORDER_PATH <- file.path(LD_DIR, sprintf("%s_LD_variant_order.tsv", GENE_NAME))
+LD_LONG_PATH <- file.path(LD_DIR, sprintf("%s_phase1_LD_R_long.parquet", GENE_NAME))
+ANNOTATION_PATH <- file.path(ANNOTATION_DIR, sprintf("%s_alphagenome_variant_scores.csv", GENE_NAME))
+
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("Master path:", MASTER_PATH, "\n")
+cat("LD order path:", ORDER_PATH, "\n")
+cat("LD parquet path:", LD_LONG_PATH, "\n")
+cat("Annotation path:", ANNOTATION_PATH, "\n")
+```
+
+## Load and align z, a, and LD order
+
+```{r load-inputs}
+master_df <- readr::read_csv(MASTER_PATH, show_col_types = FALSE)
+order_df <- readr::read_tsv(ORDER_PATH, show_col_types = FALSE)
+annotation_df <- readr::read_csv(ANNOTATION_PATH, show_col_types = FALSE)
+
+stopifnot(nrow(master_df) == nrow(order_df))
+
+aligned_df <- order_df %>%
+  left_join(
+    master_df %>%
+      transmute(
+        variant_id,
+        z = z_score,
+        sample_size,
+        ld_matrix_index
+      ),
+    by = c("id" = "variant_id")
+  ) %>%
+  left_join(
+    annotation_df %>%
+      transmute(
+        variant_id = source_variant_id,
+        a = alphagenome_raw_mean,
+        alphagenome_track_count
+      ),
+    by = c("id" = "variant_id")
+  ) %>%
+  mutate(
+    a_missing = is.na(a),
+    a = if_else(is.na(a), 0, a)
+  ) %>%
+  arrange(index)
+
+stopifnot(all(aligned_df$index == seq_len(nrow(aligned_df)) - 1L))
+stopifnot(!any(is.na(aligned_df$z)))
+
+if (!is.null(MAX_VARIANTS)) {
+  keep_n <- min(MAX_VARIANTS, nrow(aligned_df))
+  aligned_df <- aligned_df %>% slice_head(n = keep_n)
+}
+
+z <- aligned_df$z
+a <- aligned_df$a
+n_vec <- aligned_df$sample_size
+n_rss <- round(mean(n_vec))
+
+cat("Variants loaded:", nrow(aligned_df), "\n")
+cat("Annotation-missing variants filled with 0:", sum(aligned_df$a_missing), "\n")
+cat("Mean sample size used for susie_rss n:", n_rss, "\n")
+```
+
+## Reconstruct the dense LD matrix
+
+```{r build-r}
+ld_long_df <- arrow::read_parquet(LD_LONG_PATH) %>%
+  as_tibble()
+
+if (!is.null(MAX_VARIANTS)) {
+  ld_long_df <- ld_long_df %>%
+    filter(snp_index_1 < nrow(aligned_df), snp_index_2 < nrow(aligned_df))
+}
+
+p <- nrow(aligned_df)
+R_sparse <- sparseMatrix(
+  i = c(ld_long_df$snp_index_1 + 1L, ld_long_df$snp_index_2 + 1L, seq_len(p)),
+  j = c(ld_long_df$snp_index_2 + 1L, ld_long_df$snp_index_1 + 1L, seq_len(p)),
+  x = c(ld_long_df$r, ld_long_df$r, rep(1, p)),
+  dims = c(p, p)
+)
+R <- as.matrix(R_sparse)
+
+rm(ld_long_df, R_sparse)
+gc()
+
+cat("LD matrix dimension:", paste(dim(R), collapse = " x "), "\n")
+cat("Max asymmetry:", max(abs(R - t(R))), "\n")
+cat("Diagonal range:", paste(range(diag(R)), collapse = " to "), "\n")
+```
+
+## Basic validation checks
+
+```{r validation}
+stopifnot(length(z) == nrow(R), length(a) == nrow(R))
+stopifnot(max(abs(R - t(R))) < 1e-8)
+stopifnot(all(abs(diag(R) - 1) < 1e-8))
+
+validation_summary <- tibble(
+  metric = c(
+    "p_variants",
+    "z_mean",
+    "z_sd",
+    "annotation_mean",
+    "annotation_sd",
+    "annotation_zero_count",
+    "n_rss"
+  ),
+  value = c(
+    length(z),
+    mean(z),
+    sd(z),
+    mean(a),
+    sd(a),
+    sum(a == 0),
+    n_rss
+  )
+)
+
+validation_summary
+```
+
+## Run susie_rss
+
+Note: `susie_rss` uses `z` and `R`. The annotation vector `a` is loaded and aligned here for validation, but it is not consumed by `susie_rss`.
+
+```{r run-susie}
+susie_fit <- susieR::susie_rss(
+  z = z,
+  R = R,
+  n = n_rss,
+  L = SUSIE_L,
+  estimate_residual_variance = FALSE,
+  check_prior = FALSE
+)
+
+susie_summary <- tibble(
+  pip_gt_0_1 = sum(susie_fit$pip > 0.1),
+  pip_gt_0_5 = sum(susie_fit$pip > 0.5),
+  cs_count = length(susie_fit$sets$cs),
+  elbo_last = tail(susie_fit$elbo, 1)
+)
+
+susie_summary
+```
+
+## Inspect top variants
+
+```{r inspect-top}
+top_df <- aligned_df %>%
+  mutate(pip = susie_fit$pip) %>%
+  arrange(desc(pip)) %>%
+  slice_head(n = 20)
+
+top_df %>%
+  select(index, id, chrom, pos, ref, alt, z, a, alphagenome_track_count, pip)
+```
+
+## Quick plots
+
+```{r quick-plots, fig.height=4, fig.width=7}
+ggplot(aligned_df %>% mutate(pip = susie_fit$pip), aes(x = z, y = pip, color = a)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  scale_color_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#b2182b") +
+  labs(
+    title = sprintf("%s: z vs PIP with AlphaGenome annotation", GENE_NAME),
+    x = "z-score",
+    y = "PIP",
+    color = "a"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Optional handoff objects
+
+```{r handoff}
+str(list(
+  z = z,
+  a = a,
+  R_dim = dim(R),
+  n_rss = n_rss
+))
+```

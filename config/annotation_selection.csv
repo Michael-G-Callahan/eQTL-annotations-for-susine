@@ -1,0 +1,2 @@
+locus_id,annotate,notes,priority,annotation_gene_name_override,annotation_gene_id_override,annotation_tissue_override
+CBX8_lung,TRUE,Example selected locus,1,,,

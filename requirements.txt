@@ -1,0 +1,19 @@
+# Core pipeline (z-scores, LD, annotation, mu_0 prep)
+pandas>=2.0
+pyarrow>=14.0
+numpy>=1.24
+matplotlib>=3.7
+pysam>=0.22
+# AlphaGenome scoring client (Google DeepMind).
+# Install from PyPI: pip install alphagenome
+# or from source: https://github.com/google-deepmind/alphagenome
+# Requires an ALPHAGENOME_API_KEY environment variable at runtime.
+alphagenome
+# Notebook / plotting extras
+seaborn>=0.12
+tqdm>=4.65
+# Optional: prediction study (utils/prediction.py) and reference-sequence fetch
+# (utils/genome.py, notebooks). Uncomment if you run those paths.
+# torch>=2.0
+# grelu
+# genomepy

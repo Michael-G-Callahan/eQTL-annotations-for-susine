@@ -1,0 +1,1331 @@
+---
+title: "0.4 Explore Baseline SuSiE Metrics"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+This workbook collects compact vanilla SuSiE screening outputs, joins them to
+Phase 1 QC/z/LD metrics, and renders exploratory plots for deciding a later
+stratified resampling design.
+
+```{r setup, message=FALSE}
+required_packages <- c("dplyr", "ggplot2", "readr", "tibble", "tidyr", "purrr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this workbook."
+  )
+}
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(tidyr)
+library(purrr)
+
+theme_set(theme_bw(base_size = 11))
+```
+
+# 1. Configuration
+
+```{r config}
+find_project_root <- function(start = getwd()) {
+  # Example fallback path -- set to your environment (or set EQTL_SUSINE_PROJECT_ROOT).
+  hardcoded <- "/path/to/eQTL_annotations_for_susine"
+  env_root <- Sys.getenv("EQTL_SUSINE_PROJECT_ROOT", unset = "")
+  candidates <- unique(c(
+    env_root,
+    hardcoded,
+    normalizePath(start, winslash = "/", mustWork = FALSE),
+    dirname(normalizePath(start, winslash = "/", mustWork = FALSE)),
+    dirname(dirname(normalizePath(start, winslash = "/", mustWork = FALSE)))
+  ))
+  candidates <- candidates[nzchar(candidates)]
+  for (candidate in candidates) {
+    if (
+      dir.exists(file.path(candidate, "utils")) &&
+      dir.exists(file.path(candidate, "vignettes")) &&
+      file.exists(file.path(candidate, "README.md"))
+    ) {
+      return(normalizePath(candidate, winslash = "/", mustWork = TRUE))
+    }
+  }
+  stop("Could not locate eQTL_annotations_for_susine project root.")
+}
+
+PROJECT_ROOT <- find_project_root()
+MANIFEST_PATH <- file.path(PROJECT_ROOT, "config", "loci_manifest_sample_100_per_chrom.csv")
+SCREEN_DIR <- file.path(PROJECT_ROOT, "output", "prelim", "baseline_susie_screen")
+TASK_MANIFEST_PATH <- file.path(SCREEN_DIR, "baseline_susie_task_manifest.csv")
+QC_TABLE_PATH <- file.path(SCREEN_DIR, "qc_locus_table.csv")
+TASK_OUTPUT_ROOT <- file.path(PROJECT_ROOT, "output", "baseline_susie_screen", "task_outputs")
+COLLECTED_DIR <- file.path(PROJECT_ROOT, "output", "baseline_susie_screen", "collected")
+FIGURE_DIR <- file.path(PROJECT_ROOT, "output", "baseline_susie_screen", "figures")
+GEOMETRIC_N20_DIR <- file.path(PROJECT_ROOT, "output", "baseline_susie_screen", "selected_geometric_n20")
+
+dir.create(COLLECTED_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(GEOMETRIC_N20_DIR, recursive = TRUE, showWarnings = FALSE)
+
+LOCUS_METRICS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_locus_metrics.csv")
+EFFECT_METRICS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_effect_metrics.csv")
+TOP_VARIANTS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_top_variants.csv")
+JOINED_METRICS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_metric_joined.csv")
+MISSING_TASKS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_missing_task_outputs.csv")
+LOCKED_GEOMETRIC_N20_PATH <- file.path(GEOMETRIC_N20_DIR, "locked_loci.csv")
+LOCKED_GEOMETRIC_N20_MANIFEST_PATH <- file.path(GEOMETRIC_N20_DIR, "locked_loci_with_manifest.csv")
+LOCKED_GEOMETRIC_N20_SELECTION_PATH <- file.path(GEOMETRIC_N20_DIR, "annotation_selection_geometric_n20.csv")
+CONFIG_GEOMETRIC_N20_SELECTION_PATH <- file.path(PROJECT_ROOT, "config", "annotation_selection_geometric_n20.csv")
+
+LABEL_LOCI <- c("mei1_chr22_lung", "pus7l_chr12_lung")
+Z_HIGH_THRESHOLD <- 5
+PIP_HIGH_THRESHOLD <- 0.5
+PIP_STRONG_THRESHOLD <- 0.9
+
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("Screen dir:", SCREEN_DIR, "\n")
+cat("Task output root:", TASK_OUTPUT_ROOT, "\n")
+```
+
+# 2. Collection Helpers
+
+```{r helpers}
+task_output_col_types <- function(filename) {
+  if (identical(filename, "locus_metrics.csv")) {
+    return(readr::cols(
+      locus_id = readr::col_character(),
+      gene_name = readr::col_character(),
+      n_variants = readr::col_integer(),
+      n_rss = readr::col_integer(),
+      status = readr::col_character(),
+      error_message = readr::col_character(),
+      elapsed_seconds = readr::col_double(),
+      elbo_last = readr::col_double(),
+      n_iter = readr::col_integer(),
+      max_pip = readr::col_double(),
+      pip_sum = readr::col_double(),
+      pip_entropy = readr::col_double(),
+      pip_k_eff = readr::col_double(),
+      pip_top1_share = readr::col_double(),
+      pip_top2_gap = readr::col_double(),
+      n_pip_gt_0_01 = readr::col_integer(),
+      n_pip_gt_0_05 = readr::col_integer(),
+      n_pip_gt_0_1 = readr::col_integer(),
+      n_pip_gt_0_5 = readr::col_integer(),
+      n_pip_gt_0_9 = readr::col_integer(),
+      z_max_abs = readr::col_double(),
+      z_topk_ratio = readr::col_double(),
+      z_count_abs_gt_3 = readr::col_integer(),
+      z_eff_signals = readr::col_double(),
+      n_active_effects = readr::col_integer(),
+      min_active_alpha_max = readr::col_double(),
+      median_active_alpha_max = readr::col_double(),
+      max_active_alpha_max = readr::col_double(),
+      min_active_alpha_k_eff_core95 = readr::col_double(),
+      median_active_alpha_k_eff_core95 = readr::col_double(),
+      max_active_alpha_k_eff_core95 = readr::col_double(),
+      .default = readr::col_guess()
+    ))
+  }
+  if (identical(filename, "effect_metrics.csv")) {
+    return(readr::cols(
+      locus_id = readr::col_character(),
+      gene_name = readr::col_character(),
+      effect_l = readr::col_integer(),
+      alpha_max = readr::col_double(),
+      alpha_entropy = readr::col_double(),
+      alpha_entropy_core95 = readr::col_double(),
+      alpha_k_eff = readr::col_double(),
+      alpha_k_eff_core95 = readr::col_double(),
+      cs_size_raw = readr::col_integer(),
+      cs_purity = readr::col_double(),
+      .default = readr::col_guess()
+    ))
+  }
+  if (identical(filename, "top_variants.csv")) {
+    return(readr::cols(
+      locus_id = readr::col_character(),
+      gene_name = readr::col_character(),
+      rank_pip = readr::col_integer(),
+      variant_id = readr::col_character(),
+      ld_matrix_index = readr::col_integer(),
+      chrom = readr::col_character(),
+      pos = readr::col_integer(),
+      ref = readr::col_character(),
+      alt = readr::col_character(),
+      z_score = readr::col_double(),
+      pip = readr::col_double(),
+      posterior_mean = readr::col_double(),
+      .default = readr::col_guess()
+    ))
+  }
+  readr::cols(.default = readr::col_guess())
+}
+
+read_optional_csv <- function(path, filename = basename(path)) {
+  if (!file.exists(path)) return(NULL)
+  readr::read_csv(path, col_types = task_output_col_types(filename), show_col_types = FALSE)
+}
+
+bind_task_csv <- function(task_manifest, filename) {
+  rows <- purrr::map(seq_len(nrow(task_manifest)), function(i) {
+    path <- file.path(task_manifest$output_dir[[i]], filename)
+    tbl <- read_optional_csv(path, filename = filename)
+    if (is.null(tbl)) return(NULL)
+    tbl
+  })
+  rows <- rows[!vapply(rows, is.null, logical(1))]
+  if (!length(rows)) tibble() else dplyr::bind_rows(rows)
+}
+
+empty_locus_metrics <- function() {
+  tibble(
+    locus_id = character(),
+    gene_name = character(),
+    status = character(),
+    n_variants = integer(),
+    n_rss = integer(),
+    elapsed_seconds = double(),
+    elbo_last = double(),
+    n_iter = integer(),
+    max_pip = double(),
+    pip_sum = double(),
+    pip_entropy = double(),
+    pip_k_eff = double(),
+    pip_top1_share = double(),
+    pip_top2_gap = double(),
+    n_pip_gt_0_01 = integer(),
+    n_pip_gt_0_05 = integer(),
+    n_pip_gt_0_1 = integer(),
+    n_pip_gt_0_5 = integer(),
+    n_pip_gt_0_9 = integer(),
+    z_max_abs = double(),
+    z_topk_ratio = double(),
+    z_count_abs_gt_3 = integer(),
+    z_eff_signals = double(),
+    n_active_effects = integer(),
+    min_active_alpha_max = double(),
+    median_active_alpha_max = double(),
+    max_active_alpha_max = double(),
+    min_active_alpha_k_eff_core95 = double(),
+    median_active_alpha_k_eff_core95 = double(),
+    max_active_alpha_k_eff_core95 = double()
+  )
+}
+
+empty_effect_metrics <- function() {
+  tibble(
+    locus_id = character(),
+    gene_name = character(),
+    effect_l = integer(),
+    alpha_max = double(),
+    alpha_entropy = double(),
+    alpha_entropy_core95 = double(),
+    alpha_k_eff = double(),
+    alpha_k_eff_core95 = double(),
+    cs_size_raw = integer(),
+    cs_purity = double()
+  )
+}
+
+empty_top_variants <- function() {
+  tibble(
+    locus_id = character(),
+    gene_name = character(),
+    rank_pip = integer(),
+    variant_id = character(),
+    ld_matrix_index = integer(),
+    chrom = character(),
+    pos = integer(),
+    ref = character(),
+    alt = character(),
+    z_score = double(),
+    pip = double(),
+    posterior_mean = double()
+  )
+}
+
+numeric_cols <- function(df) {
+  names(df)[vapply(df, is.numeric, logical(1))]
+}
+
+safe_cor <- function(x, y) {
+  keep <- is.finite(x) & is.finite(y)
+  if (sum(keep) < 3L) return(NA_real_)
+  suppressWarnings(stats::cor(x[keep], y[keep], method = "spearman"))
+}
+
+robust_scale <- function(df) {
+  out <- df
+  for (nm in names(out)) {
+    x <- as.numeric(out[[nm]])
+    med <- stats::median(x, na.rm = TRUE)
+    iqr <- stats::IQR(x, na.rm = TRUE)
+    if (!is.finite(iqr) || iqr == 0) {
+      iqr <- stats::sd(x, na.rm = TRUE)
+    }
+    if (!is.finite(iqr) || iqr == 0) {
+      iqr <- 1
+    }
+    out[[nm]] <- (x - med) / iqr
+  }
+  out
+}
+
+complete_pair_count <- function(x, y) {
+  sum(is.finite(x) & is.finite(y))
+}
+
+first_existing_col <- function(df, candidates) {
+  hits <- candidates[candidates %in% names(df)]
+  if (length(hits)) hits[[1]] else NA_character_
+}
+
+copy_first_available <- function(df, target, candidates) {
+  source_col <- first_existing_col(df, candidates)
+  if (is.na(source_col)) {
+    df[[target]] <- NA_real_
+  } else {
+    df[[target]] <- df[[source_col]]
+  }
+  df
+}
+
+transform_for_pca <- function(df, cols) {
+  x <- df %>% dplyr::select(dplyr::all_of(cols))
+  for (nm in names(x)) {
+    if (grepl("count|n_|k_eff|eff_signals", nm)) {
+      vals <- as.numeric(x[[nm]])
+      min_val <- suppressWarnings(min(vals, na.rm = TRUE))
+      if (is.finite(min_val) && min_val >= 0) {
+        x[[nm]] <- log1p(vals)
+      }
+    }
+  }
+  x
+}
+
+drop_bad_pca_cols <- function(df, cols, min_complete = 3L) {
+  cols[vapply(cols, function(nm) {
+    x <- as.numeric(df[[nm]])
+    keep <- is.finite(x)
+    sum(keep) >= min_complete && is.finite(stats::sd(x[keep])) && stats::sd(x[keep]) > 0
+  }, logical(1))]
+}
+
+make_cv_folds <- function(n, k = 5L, seed = 1L) {
+  set.seed(seed)
+  sample(rep(seq_len(k), length.out = n))
+}
+
+label_loci_layer <- function(df, x_col, y_col) {
+  label_df <- df %>% dplyr::filter(.data$locus_id %in% LABEL_LOCI)
+  if (!nrow(label_df)) return(NULL)
+  geom_text(
+    data = label_df,
+    aes(x = .data[[x_col]], y = .data[[y_col]], label = .data$locus_id),
+    size = 3,
+    nudge_y = 0.03,
+    check_overlap = TRUE
+  )
+}
+```
+
+# 3. Collect Outputs
+
+```{r collect}
+task_manifest <- readr::read_csv(TASK_MANIFEST_PATH, show_col_types = FALSE)
+qc_locus_table <- readr::read_csv(QC_TABLE_PATH, show_col_types = FALSE)
+
+missing_task_outputs <- task_manifest %>%
+  dplyr::mutate(
+    locus_metrics_path = file.path(.data$output_dir, "locus_metrics.csv"),
+    effect_metrics_path = file.path(.data$output_dir, "effect_metrics.csv"),
+    top_variants_path = file.path(.data$output_dir, "top_variants.csv"),
+    has_locus_metrics = file.exists(.data$locus_metrics_path),
+    has_effect_metrics = file.exists(.data$effect_metrics_path),
+    has_top_variants = file.exists(.data$top_variants_path)
+  ) %>%
+  dplyr::filter(!.data$has_locus_metrics | !.data$has_effect_metrics | !.data$has_top_variants)
+
+readr::write_csv(missing_task_outputs, MISSING_TASKS_PATH)
+
+locus_metrics <- dplyr::bind_rows(empty_locus_metrics(), bind_task_csv(task_manifest, "locus_metrics.csv"))
+effect_metrics <- dplyr::bind_rows(empty_effect_metrics(), bind_task_csv(task_manifest, "effect_metrics.csv"))
+top_variants <- dplyr::bind_rows(empty_top_variants(), bind_task_csv(task_manifest, "top_variants.csv"))
+
+joined_metrics <- qc_locus_table %>%
+  dplyr::left_join(
+    locus_metrics,
+    by = c("locus_id", "gene_name"),
+    suffix = c("_phase1", "_susie")
+  ) %>%
+  dplyr::mutate(
+    phase1_status = dplyr::coalesce(.data$status_phase1, NA_character_),
+    susie_status = dplyr::coalesce(.data$status_susie, NA_character_),
+    status = .data$susie_status,
+    z_signal_zone = dplyr::case_when(
+      is.finite(.data$z_max_abs) & .data$z_max_abs >= Z_HIGH_THRESHOLD ~ "high_z",
+      is.finite(.data$z_max_abs) ~ "low_or_moderate_z",
+      TRUE ~ "missing_z"
+    ),
+    pip_zone = dplyr::case_when(
+      is.finite(.data$max_pip) & .data$max_pip >= PIP_STRONG_THRESHOLD ~ "pip_ge_0p9",
+      is.finite(.data$max_pip) & .data$max_pip >= PIP_HIGH_THRESHOLD ~ "pip_0p5_to_0p9",
+      is.finite(.data$max_pip) ~ "pip_lt_0p5",
+      TRUE ~ "missing_pip"
+    ),
+    signal_pip_zone = paste(.data$z_signal_zone, .data$pip_zone, sep = "__")
+  )
+
+joined_metrics <- joined_metrics %>%
+  copy_first_available("z_eff_signals_for_sampling", c("z_eff_signals_phase1", "z_eff_signals_susie", "z_eff_signals")) %>%
+  copy_first_available("z_count_abs_gt_3_for_sampling", c("z_count_abs_gt_3_phase1", "z_count_abs_gt_3_susie", "z_count_abs_gt_3")) %>%
+  copy_first_available("n_variants_for_sampling", c("n_variants_phase1", "n_variants_susie", "phase1_master_variants", "ld_matched_variants"))
+
+readr::write_csv(locus_metrics, LOCUS_METRICS_PATH)
+readr::write_csv(effect_metrics, EFFECT_METRICS_PATH)
+readr::write_csv(top_variants, TOP_VARIANTS_PATH)
+readr::write_csv(joined_metrics, JOINED_METRICS_PATH)
+
+signal_metric_cols <- intersect(
+  c(
+    "z_max_abs", "z_topk_ratio", "z_count_abs_gt_3_susie", "z_eff_signals_susie",
+    "z_count_abs_gt_3_phase1", "z_eff_signals_phase1",
+    "z_count_abs_gt_3_for_sampling", "z_eff_signals_for_sampling"
+  ),
+  names(joined_metrics)
+)
+posterior_metric_cols <- intersect(
+  c(
+    "max_pip", "pip_sum", "pip_entropy", "pip_k_eff", "pip_top1_share",
+    "pip_top2_gap", "n_pip_gt_0_01", "n_pip_gt_0_05", "n_pip_gt_0_1",
+    "n_pip_gt_0_5", "n_pip_gt_0_9"
+  ),
+  names(joined_metrics)
+)
+effect_summary_metric_cols <- intersect(
+  c(
+    "n_active_effects", "min_active_alpha_max", "median_active_alpha_max",
+    "max_active_alpha_max", "min_active_alpha_k_eff_core95",
+    "median_active_alpha_k_eff_core95", "max_active_alpha_k_eff_core95"
+  ),
+  names(joined_metrics)
+)
+run_bookkeeping_cols <- intersect(
+  c("task_id", "elapsed_seconds", "elbo_last", "n_iter", "n_rss", "n_rss_qc"),
+  names(joined_metrics)
+)
+susie_metric_cols <- unique(c(signal_metric_cols, posterior_metric_cols, effect_summary_metric_cols))
+dataset_difficulty_metric_cols <- intersect(
+  c(
+    "M1", "M2", "M4",
+    "raw_gene_variants_loaded", "post_af_filter", "post_sample_size_filter",
+    "z_score_variants_exported", "phase1_master_variants",
+    "ld_input_variants", "ld_matched_variants", "ld_unmatched_variants",
+    "matched_variants_in_1000g", "n_variants_phase1", "n_variants_for_sampling",
+    "z_eff_signals_phase1", "z_count_abs_gt_3_phase1",
+    "z_eff_signals_for_sampling", "z_count_abs_gt_3_for_sampling"
+  ),
+  setdiff(names(joined_metrics), c(run_bookkeeping_cols, posterior_metric_cols, effect_summary_metric_cols))
+)
+
+metric_inventory <- tibble(
+  metric = unique(c(dataset_difficulty_metric_cols, signal_metric_cols, posterior_metric_cols, effect_summary_metric_cols))
+) %>%
+  dplyr::mutate(
+    metric_group = dplyr::case_when(
+    .data$metric %in% dataset_difficulty_metric_cols ~ "phase1_qc_dataset_difficulty",
+    .data$metric %in% signal_metric_cols ~ "aligned_z_signal",
+    .data$metric %in% posterior_metric_cols ~ "baseline_susie_posterior",
+    .data$metric %in% effect_summary_metric_cols ~ "baseline_susie_effect_summary",
+    TRUE ~ "other"
+    )
+  )
+readr::write_csv(metric_inventory, file.path(COLLECTED_DIR, "baseline_susie_metric_inventory.csv"))
+
+list(
+  task_count = nrow(task_manifest),
+  missing_task_outputs = nrow(missing_task_outputs),
+  collected_locus_rows = nrow(locus_metrics),
+  collected_effect_rows = nrow(effect_metrics),
+  collected_top_variant_rows = nrow(top_variants),
+  dataset_difficulty_metrics = length(dataset_difficulty_metric_cols),
+  susie_signal_posterior_effect_metrics = length(susie_metric_cols)
+)
+```
+
+```{r status-summary}
+joined_metrics %>%
+  dplyr::count(.data$qc_status, .data$status, .data$signal_pip_zone, sort = TRUE)
+```
+
+# 4. Histograms
+
+```{r histograms, fig.width=16, fig.height=12}
+hist_metric_cols <- setdiff(numeric_cols(joined_metrics), c("task_id"))
+hist_df <- joined_metrics %>%
+  dplyr::select(dplyr::all_of(c("locus_id", hist_metric_cols))) %>%
+  tidyr::pivot_longer(-.data$locus_id, names_to = "metric", values_to = "value") %>%
+  dplyr::filter(is.finite(.data$value))
+
+if (nrow(hist_df) > 0) {
+  p_hist <- ggplot(hist_df, aes(x = .data$value)) +
+    geom_histogram(bins = 35, fill = "#33658A", color = "white", linewidth = 0.2) +
+    facet_wrap(~ metric, scales = "free", ncol = 5) +
+    labs(title = "Histograms for Phase 1, QC, z, PIP, and effect-diffuseness metrics",
+         x = NULL, y = "Locus count")
+} else {
+  p_hist <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No finite numeric metrics available yet.") +
+    theme_void()
+}
+
+ggsave(file.path(FIGURE_DIR, "all_metric_histograms.png"), p_hist, width = 16, height = 12, dpi = 150)
+p_hist
+```
+
+# 5. Correlations and Scatterplots
+
+```{r correlation-heatmap, fig.width=10, fig.height=8}
+focus_metrics <- c(
+  "z_max_abs", "z_topk_ratio", "z_eff_signals_for_sampling",
+  "max_pip", "pip_k_eff", "pip_top2_gap",
+  "M1", "M2", "M4",
+  "n_active_effects", "median_active_alpha_k_eff_core95"
+)
+focus_metrics <- intersect(focus_metrics, names(joined_metrics))
+
+cor_pairs <- tidyr::expand_grid(x_metric = focus_metrics, y_metric = focus_metrics) %>%
+  dplyr::mutate(
+    rho = purrr::map2_dbl(
+      .data$x_metric,
+      .data$y_metric,
+      ~ safe_cor(joined_metrics[[.x]], joined_metrics[[.y]])
+    )
+  )
+
+p_cor <- ggplot(cor_pairs, aes(x = .data$x_metric, y = .data$y_metric, fill = .data$rho)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1), na.value = "grey85") +
+  coord_equal() +
+  labs(title = "Spearman correlation heatmap", x = NULL, y = NULL, fill = "rho") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURE_DIR, "metric_correlation_heatmap.png"), p_cor, width = 10, height = 8, dpi = 150)
+p_cor
+```
+
+```{r difficulty-vs-susie-correlations, fig.width=14, fig.height=10}
+difficulty_vs_susie_pairs <- tidyr::expand_grid(
+  difficulty_metric = dataset_difficulty_metric_cols,
+  susie_metric = susie_metric_cols
+) %>%
+  dplyr::mutate(
+    n_complete = purrr::map2_int(
+      .data$difficulty_metric,
+      .data$susie_metric,
+      ~ complete_pair_count(joined_metrics[[.x]], joined_metrics[[.y]])
+    ),
+    rho = purrr::map2_dbl(
+      .data$difficulty_metric,
+      .data$susie_metric,
+      ~ safe_cor(joined_metrics[[.x]], joined_metrics[[.y]])
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(abs(.data$rho)))
+
+readr::write_csv(
+  difficulty_vs_susie_pairs,
+  file.path(COLLECTED_DIR, "baseline_susie_difficulty_vs_susie_correlations.csv")
+)
+
+if (nrow(difficulty_vs_susie_pairs) > 0) {
+  p_diff_susie_cor <- ggplot(
+    difficulty_vs_susie_pairs,
+    aes(x = .data$susie_metric, y = .data$difficulty_metric, fill = .data$rho)
+  ) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1), na.value = "grey85") +
+    labs(
+      title = "Dataset difficulty metrics vs baseline SuSiE metrics",
+      x = "Baseline SuSiE / aligned-z metric",
+      y = "Phase-1/QC dataset difficulty metric",
+      fill = "Spearman rho"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  p_diff_susie_cor <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No dataset difficulty and SuSiE metric pairs available yet.") +
+    theme_void()
+}
+
+ggsave(file.path(FIGURE_DIR, "difficulty_vs_susie_correlation_heatmap.png"), p_diff_susie_cor, width = 14, height = 10, dpi = 150)
+p_diff_susie_cor
+```
+
+```{r scatterplots, fig.width=14, fig.height=10}
+scatter_pairs <- tibble::tribble(
+  ~x_metric, ~y_metric,
+  "z_max_abs", "max_pip",
+  "z_topk_ratio", "max_pip",
+  "z_eff_signals_for_sampling", "pip_k_eff",
+  "z_eff_signals_for_sampling", "max_pip",
+  "M1", "max_pip",
+  "M1", "pip_k_eff",
+  "M2", "max_pip",
+  "M4", "max_pip",
+  "pip_top2_gap", "max_pip",
+  "median_active_alpha_k_eff_core95", "max_pip"
+) %>%
+  dplyr::filter(.data$x_metric %in% names(joined_metrics), .data$y_metric %in% names(joined_metrics))
+
+scatter_df <- purrr::pmap_dfr(scatter_pairs, function(x_metric, y_metric) {
+  joined_metrics %>%
+    dplyr::transmute(
+      locus_id = .data$locus_id,
+      qc_status = .data$qc_status,
+      signal_pip_zone = .data$signal_pip_zone,
+      x_value = .data[[x_metric]],
+      y_value = .data[[y_metric]],
+      pair = paste(x_metric, "vs", y_metric)
+    )
+})
+
+if (nrow(scatter_df) > 0) {
+  p_scatter <- ggplot(scatter_df, aes(x = .data$x_value, y = .data$y_value, color = .data$signal_pip_zone)) +
+    geom_point(alpha = 0.75, size = 1.8) +
+    facet_wrap(~ pair, scales = "free", ncol = 3) +
+    labs(title = "Focused metric scatterplots", x = NULL, y = NULL, color = "Zone") +
+    theme(legend.position = "bottom")
+} else {
+  p_scatter <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No focused metric pairs available yet.") +
+    theme_void()
+}
+
+ggsave(file.path(FIGURE_DIR, "metric_pairwise_scatter.png"), p_scatter, width = 14, height = 10, dpi = 150)
+p_scatter
+```
+
+```{r difficulty-vs-susie-top-scatterplots, fig.width=16, fig.height=12}
+top_difficulty_susie_pairs <- difficulty_vs_susie_pairs %>%
+  dplyr::filter(is.finite(.data$rho), .data$n_complete >= 3L) %>%
+  dplyr::slice_head(n = 24)
+
+top_difficulty_susie_scatter_df <- purrr::pmap_dfr(
+  top_difficulty_susie_pairs,
+  function(difficulty_metric, susie_metric, n_complete, rho) {
+    joined_metrics %>%
+      dplyr::transmute(
+        locus_id = .data$locus_id,
+        signal_pip_zone = .data$signal_pip_zone,
+        x_value = .data[[difficulty_metric]],
+        y_value = .data[[susie_metric]],
+        pair = sprintf("%s vs %s (rho=%.2f)", difficulty_metric, susie_metric, rho)
+      )
+  }
+)
+
+if (nrow(top_difficulty_susie_scatter_df) > 0) {
+  p_top_diff_scatter <- ggplot(
+    top_difficulty_susie_scatter_df,
+    aes(x = .data$x_value, y = .data$y_value, color = .data$signal_pip_zone)
+  ) +
+    geom_point(alpha = 0.75, size = 1.8) +
+    facet_wrap(~ pair, scales = "free", ncol = 4) +
+    labs(
+      title = "Top dataset difficulty vs baseline SuSiE metric relationships",
+      x = NULL,
+      y = NULL,
+      color = "Zone"
+    ) +
+    theme(legend.position = "bottom")
+} else {
+  p_top_diff_scatter <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No finite difficulty-vs-SuSiE scatter pairs available yet.") +
+    theme_void()
+}
+
+ggsave(file.path(FIGURE_DIR, "top_difficulty_vs_susie_scatter.png"), p_top_diff_scatter, width = 16, height = 12, dpi = 150)
+p_top_diff_scatter
+```
+
+# 6. PCA on Signal and Posterior Metrics
+
+```{r pca, fig.width=9, fig.height=7}
+pca_metrics <- c(
+  "z_max_abs", "z_topk_ratio", "z_eff_signals_for_sampling",
+  "max_pip", "pip_k_eff", "pip_top2_gap",
+  "n_active_effects", "median_active_alpha_k_eff_core95",
+  "max_active_alpha_k_eff_core95"
+)
+pca_metrics <- intersect(pca_metrics, names(joined_metrics))
+
+pca_input <- joined_metrics %>%
+  dplyr::filter(.data$qc_status == "qc_pass", .data$status == "completed") %>%
+  dplyr::select(dplyr::all_of(c("locus_id", "signal_pip_zone", pca_metrics))) %>%
+  tidyr::drop_na(dplyr::all_of(pca_metrics))
+
+if (nrow(pca_input) >= 3L && length(pca_metrics) >= 2L) {
+  x <- transform_for_pca(pca_input, pca_metrics) %>%
+    dplyr::select(dplyr::all_of(pca_metrics)) %>%
+    robust_scale()
+  pca_fit <- stats::prcomp(x, center = FALSE, scale. = FALSE)
+  pca_scores <- pca_input %>%
+    dplyr::select(dplyr::all_of(c("locus_id", "signal_pip_zone"))) %>%
+    dplyr::bind_cols(as_tibble(pca_fit$x[, seq_len(min(5L, ncol(pca_fit$x))), drop = FALSE]))
+  pca_loadings <- as_tibble(pca_fit$rotation[, seq_len(min(5L, ncol(pca_fit$rotation))), drop = FALSE], rownames = "metric")
+  readr::write_csv(pca_scores, file.path(COLLECTED_DIR, "baseline_susie_signal_posterior_pca_scores.csv"))
+  readr::write_csv(pca_loadings, file.path(COLLECTED_DIR, "baseline_susie_signal_posterior_pca_loadings.csv"))
+
+  p_pca <- ggplot(pca_scores, aes(x = .data$PC1, y = .data$PC2, color = .data$signal_pip_zone)) +
+    geom_point(size = 2.2, alpha = 0.8) +
+    geom_text(
+      data = pca_scores %>% dplyr::filter(.data$locus_id %in% LABEL_LOCI),
+      aes(label = .data$locus_id),
+      nudge_y = 0.05,
+      size = 3,
+      check_overlap = TRUE
+    ) +
+    labs(
+      title = "PCA on z and vanilla SuSiE posterior metrics",
+      x = "PC1",
+      y = "PC2",
+      color = "Zone"
+    ) +
+    theme(legend.position = "bottom")
+
+  ggsave(file.path(FIGURE_DIR, "signal_posterior_pca.png"), p_pca, width = 9, height = 7, dpi = 150)
+  p_pca
+} else {
+  message("Skipping PCA: need at least 3 complete rows and 2 metrics.")
+}
+```
+
+# 7. Joint PCA on Difficulty and SuSiE Metrics
+
+```{r joint-difficulty-susie-pca, fig.width=10, fig.height=8}
+joint_pca_metrics <- unique(c(dataset_difficulty_metric_cols, susie_metric_cols))
+joint_pca_metrics <- intersect(joint_pca_metrics, names(joined_metrics))
+joint_pca_metrics <- drop_bad_pca_cols(joined_metrics, joint_pca_metrics)
+
+joint_pca_input <- joined_metrics %>%
+  dplyr::filter(.data$qc_status == "qc_pass", .data$status == "completed") %>%
+  dplyr::select(dplyr::all_of(c("locus_id", "signal_pip_zone", joint_pca_metrics))) %>%
+  tidyr::drop_na(dplyr::all_of(joint_pca_metrics))
+
+if (nrow(joint_pca_input) >= 3L && length(joint_pca_metrics) >= 2L) {
+  x_joint <- transform_for_pca(joint_pca_input, joint_pca_metrics) %>%
+    dplyr::select(dplyr::all_of(joint_pca_metrics)) %>%
+    robust_scale()
+  joint_pca_fit <- stats::prcomp(x_joint, center = FALSE, scale. = FALSE)
+  joint_pca_scores <- joint_pca_input %>%
+    dplyr::select(dplyr::all_of(c("locus_id", "signal_pip_zone"))) %>%
+    dplyr::bind_cols(as_tibble(joint_pca_fit$x[, seq_len(min(5L, ncol(joint_pca_fit$x))), drop = FALSE]))
+  joint_pca_loadings <- as_tibble(
+    joint_pca_fit$rotation[, seq_len(min(5L, ncol(joint_pca_fit$rotation))), drop = FALSE],
+    rownames = "metric"
+  ) %>%
+    dplyr::left_join(metric_inventory, by = "metric")
+
+  readr::write_csv(joint_pca_scores, file.path(COLLECTED_DIR, "baseline_susie_joint_difficulty_pca_scores.csv"))
+  readr::write_csv(joint_pca_loadings, file.path(COLLECTED_DIR, "baseline_susie_joint_difficulty_pca_loadings.csv"))
+
+  p_joint_pca <- ggplot(joint_pca_scores, aes(x = .data$PC1, y = .data$PC2, color = .data$signal_pip_zone)) +
+    geom_point(size = 2.2, alpha = 0.8) +
+    geom_text(
+      data = joint_pca_scores %>% dplyr::filter(.data$locus_id %in% LABEL_LOCI),
+      aes(label = .data$locus_id),
+      nudge_y = 0.05,
+      size = 3,
+      check_overlap = TRUE
+    ) +
+    labs(
+      title = "Joint PCA on dataset difficulty and baseline SuSiE metrics",
+      x = "PC1",
+      y = "PC2",
+      color = "Zone"
+    ) +
+    theme(legend.position = "bottom")
+
+  ggsave(file.path(FIGURE_DIR, "joint_difficulty_susie_pca.png"), p_joint_pca, width = 10, height = 8, dpi = 150)
+  p_joint_pca
+} else {
+  message("Skipping joint PCA: need at least 3 complete rows and 2 usable metrics.")
+}
+```
+
+# 8. Predict Posterior Diffuseness From Dataset Metrics
+
+This section predicts baseline SuSiE posterior diffuseness from pre/post-QC
+dataset metrics. The stratification target is not the prediction alone; it is
+the predicted-vs-actual position and residual. Positive residuals are loci where
+baseline SuSiE is more diffuse than the dataset metrics would suggest.
+
+```{r predict-pip-k-eff, fig.width=8, fig.height=6}
+PIP_KEFF_PREDICTION_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_prediction.csv")
+PIP_KEFF_PREDICTION_LOADINGS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_prediction_pca_loadings.csv")
+PIP_KEFF_PREDICTION_SUMMARY_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_prediction_summary.csv")
+PIP_KEFF_RESIDUAL_CANDIDATES_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_residual_candidates.csv")
+PIP_KEFF_GEOMETRIC_SAMPLE_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_geometric_sample_n20.csv")
+PIP_KEFF_GEOMETRIC_SAMPLE_COUNTS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_geometric_sample_region_counts.csv")
+PIP_KEFF_RESIDUAL_GEOMETRIC_SAMPLE_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_residual_geometry_sample_n20.csv")
+PIP_KEFF_RESIDUAL_GEOMETRIC_SAMPLE_COUNTS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_residual_geometry_sample_region_counts.csv")
+PIP_KEFF_GEOMETRIC_SAMPLE_COMPARISON_COUNTS_PATH <- file.path(COLLECTED_DIR, "baseline_susie_pip_k_eff_geometric_sample_comparison_counts.csv")
+
+GEOMETRIC_SAMPLE_N <- 20L
+GEOMETRIC_FORCED_LOCI <- intersect("pus7l_chr12_lung", LABEL_LOCI)
+
+scale_geometry_coords <- function(df, cols) {
+  x <- as.matrix(df[, cols, drop = FALSE])
+  center <- apply(x, 2, stats::median, na.rm = TRUE)
+  scale <- apply(x, 2, stats::IQR, na.rm = TRUE)
+  sd_scale <- apply(x, 2, stats::sd, na.rm = TRUE)
+  scale[!is.finite(scale) | scale == 0] <- sd_scale[!is.finite(scale) | scale == 0]
+  scale[!is.finite(scale) | scale == 0] <- 1
+  sweep(sweep(x, 2, center, "-"), 2, scale, "/")
+}
+
+repulsive_geometric_sample <- function(df, x_col, y_col, n, forced_loci = character()) {
+  geom_df <- df %>%
+    dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data[[y_col]]))
+  if (!nrow(geom_df)) return(geom_df)
+  n <- min(as.integer(n), nrow(geom_df))
+  coords <- scale_geometry_coords(geom_df, c(x_col, y_col))
+  forced_idx <- which(geom_df$locus_id %in% forced_loci)
+  selected <- unique(forced_idx)
+
+  if (!length(selected)) {
+    selected <- which.min(rowSums(coords^2))
+  }
+
+  while (length(selected) < n) {
+    candidate_idx <- setdiff(seq_len(nrow(geom_df)), selected)
+    d_to_selected <- sapply(candidate_idx, function(i) {
+      min(sqrt(rowSums((t(t(coords[selected, , drop = FALSE]) - coords[i, ]))^2)))
+    })
+    selected <- c(selected, candidate_idx[which.max(d_to_selected)])
+  }
+
+  geom_df[selected, , drop = FALSE] %>%
+    dplyr::mutate(geometric_sample_order = seq_len(dplyr::n()))
+}
+
+assign_interpretive_region <- function(df) {
+  abs_resid_cut <- stats::quantile(abs(df$log_pip_k_eff_residual), 0.4, na.rm = TRUE)
+  df %>%
+    dplyr::mutate(
+      suggested_sampling_region = dplyr::case_when(
+        .data$predicted_pip_k_eff_bin == 3L &
+          .data$actual_pip_k_eff_bin == 3L &
+          abs(.data$log_pip_k_eff_residual) <= abs_resid_cut ~ "expected_diffuse",
+        .data$residual_zone == "more_diffuse_than_predicted" ~ "surprisingly_diffuse",
+        .data$residual_zone == "less_diffuse_than_predicted" &
+          .data$predicted_pip_k_eff_bin == 3L ~ "surprisingly_concentrated",
+        .data$predicted_pip_k_eff_bin == 1L &
+          .data$actual_pip_k_eff_bin == 1L ~ "easy_control",
+        .data$predicted_pip_k_eff_bin == 1L &
+          .data$actual_pip_k_eff_bin == 3L ~ "low_predicted_diffuse_outlier",
+        TRUE ~ "typical_or_transition"
+      )
+    )
+}
+
+target_col <- "pip_k_eff"
+pip_keff_predictor_cols <- unique(c(
+  "M1", "M2", "M4",
+  "z_eff_signals_for_sampling", "z_count_abs_gt_3_for_sampling",
+  "n_variants_for_sampling", "phase1_master_variants",
+  "ld_matched_variants", "ld_unmatched_variants", "matched_variants_in_1000g",
+  "raw_gene_variants_loaded", "post_af_filter", "post_sample_size_filter",
+  "z_score_variants_exported"
+))
+pip_keff_predictor_cols <- intersect(pip_keff_predictor_cols, dataset_difficulty_metric_cols)
+pip_keff_predictor_cols <- drop_bad_pca_cols(joined_metrics, pip_keff_predictor_cols, min_complete = 10L)
+
+pip_keff_model_df <- joined_metrics %>%
+  dplyr::filter(.data$qc_status == "qc_pass", .data$status == "completed") %>%
+  dplyr::filter(is.finite(.data[[target_col]]), .data[[target_col]] > 0) %>%
+  dplyr::select(dplyr::all_of(c(
+    "locus_id", "gene_name", "signal_pip_zone", "max_pip",
+    target_col, pip_keff_predictor_cols
+  ))) %>%
+  tidyr::drop_na(dplyr::all_of(c(target_col, pip_keff_predictor_cols)))
+
+if (nrow(pip_keff_model_df) >= 20L && length(pip_keff_predictor_cols) >= 2L) {
+  transformed_predictors <- transform_for_pca(pip_keff_model_df, pip_keff_predictor_cols) %>%
+    dplyr::select(dplyr::all_of(pip_keff_predictor_cols))
+  folds <- make_cv_folds(nrow(pip_keff_model_df), k = 5L, seed = 20260509L)
+  target_log <- log1p(pip_keff_model_df[[target_col]])
+  cv_pred_log <- rep(NA_real_, nrow(pip_keff_model_df))
+  cv_n_pcs <- rep(NA_integer_, nrow(pip_keff_model_df))
+
+  for (fold in sort(unique(folds))) {
+    train_idx <- which(folds != fold)
+    test_idx <- which(folds == fold)
+    train_x <- transformed_predictors[train_idx, , drop = FALSE] %>% robust_scale()
+    test_x_raw <- transformed_predictors[test_idx, , drop = FALSE]
+    train_center <- vapply(transformed_predictors[train_idx, , drop = FALSE], stats::median, numeric(1), na.rm = TRUE)
+    train_scale <- vapply(transformed_predictors[train_idx, , drop = FALSE], stats::IQR, numeric(1), na.rm = TRUE)
+    train_sd <- vapply(transformed_predictors[train_idx, , drop = FALSE], stats::sd, numeric(1), na.rm = TRUE)
+    train_scale[!is.finite(train_scale) | train_scale == 0] <- train_sd[!is.finite(train_scale) | train_scale == 0]
+    train_scale[!is.finite(train_scale) | train_scale == 0] <- 1
+    test_x <- as_tibble(sweep(sweep(as.matrix(test_x_raw), 2, train_center, "-"), 2, train_scale, "/"))
+
+    pca_fold <- stats::prcomp(as.matrix(train_x), center = FALSE, scale. = FALSE)
+    n_pcs <- min(8L, ncol(pca_fold$x), max(1L, floor(length(train_idx) / 10L)))
+    train_scores <- as_tibble(pca_fold$x[, seq_len(n_pcs), drop = FALSE])
+    test_scores <- as_tibble(as.matrix(test_x) %*% pca_fold$rotation[, seq_len(n_pcs), drop = FALSE])
+    names(train_scores) <- paste0("PC", seq_len(n_pcs))
+    names(test_scores) <- names(train_scores)
+    train_scores$model_target <- target_log[train_idx]
+    fold_fit <- stats::lm(model_target ~ ., data = train_scores)
+    cv_pred_log[test_idx] <- as.numeric(stats::predict(fold_fit, newdata = test_scores))
+    cv_n_pcs[test_idx] <- n_pcs
+  }
+
+  full_x <- transformed_predictors %>% robust_scale()
+  full_pca <- stats::prcomp(as.matrix(full_x), center = FALSE, scale. = FALSE)
+  full_n_pcs <- min(8L, ncol(full_pca$x), max(1L, floor(nrow(pip_keff_model_df) / 10L)))
+  full_scores <- as_tibble(full_pca$x[, seq_len(full_n_pcs), drop = FALSE])
+  names(full_scores) <- paste0("PC", seq_len(full_n_pcs))
+  full_scores$model_target <- target_log
+  full_fit <- stats::lm(model_target ~ ., data = full_scores)
+  in_sample_pred_log <- as.numeric(stats::predict(full_fit, newdata = full_scores))
+
+  pip_keff_prediction <- pip_keff_model_df %>%
+    dplyr::mutate(
+      predicted_log_pip_k_eff_cv = cv_pred_log,
+      predicted_pip_k_eff_cv = pmax(0, expm1(.data$predicted_log_pip_k_eff_cv)),
+      log1p_predicted_pip_k_eff_cv = log1p(.data$predicted_pip_k_eff_cv),
+      log1p_pip_k_eff = log1p(.data$pip_k_eff),
+      predicted_log_pip_k_eff_in_sample = in_sample_pred_log,
+      predicted_pip_k_eff_in_sample = pmax(0, expm1(.data$predicted_log_pip_k_eff_in_sample)),
+      pip_k_eff_residual = .data$pip_k_eff - .data$predicted_pip_k_eff_cv,
+      log_pip_k_eff_residual = log1p(.data$pip_k_eff) - .data$predicted_log_pip_k_eff_cv,
+      predicted_pip_k_eff_bin = dplyr::ntile(.data$predicted_pip_k_eff_cv, 3),
+      actual_pip_k_eff_bin = dplyr::ntile(.data$pip_k_eff, 3),
+      residual_bin = dplyr::ntile(.data$pip_k_eff_residual, 5),
+      predicted_actual_zone = paste0(
+        "pred", .data$predicted_pip_k_eff_bin,
+        "_actual", .data$actual_pip_k_eff_bin
+      ),
+      residual_zone = dplyr::case_when(
+        .data$residual_bin == 5L ~ "more_diffuse_than_predicted",
+        .data$residual_bin == 1L ~ "less_diffuse_than_predicted",
+        TRUE ~ "near_predicted"
+      ),
+      cv_n_pcs = cv_n_pcs
+    )
+
+  prediction_summary <- tibble(
+    n_loci = nrow(pip_keff_prediction),
+    n_predictors = length(pip_keff_predictor_cols),
+    full_model_pcs = full_n_pcs,
+    cv_spearman_actual_predicted = safe_cor(pip_keff_prediction$pip_k_eff, pip_keff_prediction$predicted_pip_k_eff_cv),
+    cv_spearman_log_actual_predicted = safe_cor(log1p(pip_keff_prediction$pip_k_eff), pip_keff_prediction$predicted_log_pip_k_eff_cv),
+    cv_rmse_log = sqrt(mean(pip_keff_prediction$log_pip_k_eff_residual^2, na.rm = TRUE)),
+    cv_median_abs_residual = stats::median(abs(pip_keff_prediction$pip_k_eff_residual), na.rm = TRUE)
+  )
+
+  prediction_loadings <- as_tibble(
+    full_pca$rotation[, seq_len(full_n_pcs), drop = FALSE],
+    rownames = "metric"
+  )
+
+  residual_candidates <- pip_keff_prediction %>%
+    dplyr::arrange(dplyr::desc(abs(.data$log_pip_k_eff_residual))) %>%
+    dplyr::select(dplyr::all_of(c(
+      "locus_id", "gene_name", "signal_pip_zone", "residual_zone",
+      "max_pip", "pip_k_eff", "predicted_pip_k_eff_cv",
+      "pip_k_eff_residual", "log_pip_k_eff_residual",
+      "M1", "M2", "M4", "z_eff_signals_for_sampling"
+    ))) %>%
+    dplyr::slice_head(n = 75)
+
+  pip_keff_prediction <- assign_interpretive_region(pip_keff_prediction)
+  geometric_sample <- repulsive_geometric_sample(
+    pip_keff_prediction,
+    x_col = "log1p_predicted_pip_k_eff_cv",
+    y_col = "log1p_pip_k_eff",
+    n = GEOMETRIC_SAMPLE_N,
+    forced_loci = GEOMETRIC_FORCED_LOCI
+  ) %>%
+    dplyr::select(dplyr::all_of(c(
+      "geometric_sample_order", "locus_id", "gene_name",
+      "suggested_sampling_region", "residual_zone", "signal_pip_zone",
+      "max_pip", "pip_k_eff", "predicted_pip_k_eff_cv",
+      "pip_k_eff_residual", "log_pip_k_eff_residual",
+      "log1p_predicted_pip_k_eff_cv", "log1p_pip_k_eff",
+      "M1", "M2", "M4", "z_eff_signals_for_sampling"
+    )))
+
+  residual_geometry_sample <- repulsive_geometric_sample(
+    pip_keff_prediction,
+    x_col = "log1p_predicted_pip_k_eff_cv",
+    y_col = "log_pip_k_eff_residual",
+    n = GEOMETRIC_SAMPLE_N,
+    forced_loci = GEOMETRIC_FORCED_LOCI
+  ) %>%
+    dplyr::rename(residual_geometry_sample_order = geometric_sample_order) %>%
+    dplyr::select(dplyr::all_of(c(
+      "residual_geometry_sample_order", "locus_id", "gene_name",
+      "suggested_sampling_region", "residual_zone", "signal_pip_zone",
+      "max_pip", "pip_k_eff", "predicted_pip_k_eff_cv",
+      "pip_k_eff_residual", "log_pip_k_eff_residual",
+      "log1p_predicted_pip_k_eff_cv", "log1p_pip_k_eff",
+      "M1", "M2", "M4", "z_eff_signals_for_sampling"
+    )))
+
+  pip_keff_prediction <- pip_keff_prediction %>%
+    dplyr::left_join(
+      geometric_sample %>%
+        dplyr::select(dplyr::all_of(c("locus_id", "geometric_sample_order"))),
+      by = "locus_id"
+    ) %>%
+    dplyr::left_join(
+      residual_geometry_sample %>%
+        dplyr::select(dplyr::all_of(c("locus_id", "residual_geometry_sample_order"))),
+      by = "locus_id"
+    ) %>%
+    dplyr::mutate(
+      geometric_sample_selected = !is.na(.data$geometric_sample_order),
+      residual_geometry_sample_selected = !is.na(.data$residual_geometry_sample_order)
+    )
+
+  soft_suggested_counts <- tibble::tribble(
+    ~suggested_sampling_region, ~soft_suggested_n,
+    "expected_diffuse", 4L,
+    "surprisingly_diffuse", 4L,
+    "surprisingly_concentrated", 4L,
+    "typical_or_transition", 4L,
+    "easy_control", 2L,
+    "low_predicted_diffuse_outlier", 2L
+  )
+
+  geometric_sample_counts <- pip_keff_prediction %>%
+    dplyr::count(.data$suggested_sampling_region, name = "available_n") %>%
+    dplyr::full_join(
+      pip_keff_prediction %>%
+        dplyr::filter(.data$geometric_sample_selected) %>%
+        dplyr::count(.data$suggested_sampling_region, name = "geometric_selected_n"),
+      by = "suggested_sampling_region"
+    ) %>%
+    dplyr::full_join(soft_suggested_counts, by = "suggested_sampling_region") %>%
+    dplyr::mutate(
+      available_n = dplyr::coalesce(.data$available_n, 0L),
+      geometric_selected_n = dplyr::coalesce(.data$geometric_selected_n, 0L),
+      soft_suggested_n = dplyr::coalesce(.data$soft_suggested_n, 0L),
+      forced_anchor_selected_n = sum(geometric_sample$locus_id %in% GEOMETRIC_FORCED_LOCI)
+    ) %>%
+    dplyr::arrange(dplyr::desc(.data$soft_suggested_n), .data$suggested_sampling_region)
+
+  residual_geometry_sample_counts <- pip_keff_prediction %>%
+    dplyr::count(.data$suggested_sampling_region, name = "available_n") %>%
+    dplyr::full_join(
+      pip_keff_prediction %>%
+        dplyr::filter(.data$residual_geometry_sample_selected) %>%
+        dplyr::count(.data$suggested_sampling_region, name = "residual_geometry_selected_n"),
+      by = "suggested_sampling_region"
+    ) %>%
+    dplyr::full_join(soft_suggested_counts, by = "suggested_sampling_region") %>%
+    dplyr::mutate(
+      available_n = dplyr::coalesce(.data$available_n, 0L),
+      residual_geometry_selected_n = dplyr::coalesce(.data$residual_geometry_selected_n, 0L),
+      soft_suggested_n = dplyr::coalesce(.data$soft_suggested_n, 0L),
+      forced_anchor_selected_n = sum(residual_geometry_sample$locus_id %in% GEOMETRIC_FORCED_LOCI)
+    ) %>%
+    dplyr::arrange(dplyr::desc(.data$soft_suggested_n), .data$suggested_sampling_region)
+
+  geometric_sample_comparison_counts <- geometric_sample_counts %>%
+    dplyr::select(dplyr::all_of(c(
+      "suggested_sampling_region", "available_n",
+      "geometric_selected_n", "soft_suggested_n"
+    ))) %>%
+    dplyr::full_join(
+      residual_geometry_sample_counts %>%
+        dplyr::select(dplyr::all_of(c(
+          "suggested_sampling_region", "residual_geometry_selected_n"
+        ))),
+      by = "suggested_sampling_region"
+    ) %>%
+    dplyr::mutate(
+      geometric_selected_n = dplyr::coalesce(.data$geometric_selected_n, 0L),
+      residual_geometry_selected_n = dplyr::coalesce(.data$residual_geometry_selected_n, 0L)
+    ) %>%
+    dplyr::arrange(dplyr::desc(.data$soft_suggested_n), .data$suggested_sampling_region)
+
+  readr::write_csv(pip_keff_prediction, PIP_KEFF_PREDICTION_PATH)
+  readr::write_csv(prediction_loadings, PIP_KEFF_PREDICTION_LOADINGS_PATH)
+  readr::write_csv(prediction_summary, PIP_KEFF_PREDICTION_SUMMARY_PATH)
+  readr::write_csv(residual_candidates, PIP_KEFF_RESIDUAL_CANDIDATES_PATH)
+  readr::write_csv(geometric_sample, PIP_KEFF_GEOMETRIC_SAMPLE_PATH)
+  readr::write_csv(geometric_sample_counts, PIP_KEFF_GEOMETRIC_SAMPLE_COUNTS_PATH)
+  readr::write_csv(residual_geometry_sample, PIP_KEFF_RESIDUAL_GEOMETRIC_SAMPLE_PATH)
+  readr::write_csv(residual_geometry_sample_counts, PIP_KEFF_RESIDUAL_GEOMETRIC_SAMPLE_COUNTS_PATH)
+  readr::write_csv(geometric_sample_comparison_counts, PIP_KEFF_GEOMETRIC_SAMPLE_COMPARISON_COUNTS_PATH)
+
+  locked_geometric_n20 <- geometric_sample %>%
+    dplyr::arrange(.data$geometric_sample_order)
+  if (nrow(locked_geometric_n20) != GEOMETRIC_SAMPLE_N ||
+      dplyr::n_distinct(locked_geometric_n20$locus_id) != GEOMETRIC_SAMPLE_N ||
+      !identical(as.integer(locked_geometric_n20$geometric_sample_order), seq_len(GEOMETRIC_SAMPLE_N))) {
+    stop("Locked geometric sample must contain exactly ", GEOMETRIC_SAMPLE_N,
+         " unique loci ordered 1..", GEOMETRIC_SAMPLE_N, ".")
+  }
+  if (!file.exists(MANIFEST_PATH)) {
+    stop("Manifest not found for locked sample export: ", MANIFEST_PATH)
+  }
+  manifest_for_lock <- readr::read_csv(MANIFEST_PATH, show_col_types = FALSE)
+  locked_manifest <- locked_geometric_n20 %>%
+    dplyr::left_join(manifest_for_lock, by = "locus_id", suffix = c("_sample", ""))
+  missing_manifest_ids <- locked_manifest %>%
+    dplyr::filter(is.na(.data$gene_id)) %>%
+    dplyr::pull(.data$locus_id)
+  if (length(missing_manifest_ids) > 0) {
+    stop("Locked sample contains loci absent from manifest: ",
+         paste(missing_manifest_ids, collapse = ", "))
+  }
+  annotation_selection_geometric_n20 <- locked_geometric_n20 %>%
+    dplyr::transmute(
+      locus_id = .data$locus_id,
+      annotate = TRUE,
+      notes = "baseline_susie_predicted_actual_geometric_n20",
+      priority = as.integer(.data$geometric_sample_order),
+      annotation_gene_name_override = NA_character_,
+      annotation_gene_id_override = NA_character_,
+      annotation_tissue_override = NA_character_
+    )
+  readr::write_csv(locked_geometric_n20, LOCKED_GEOMETRIC_N20_PATH)
+  readr::write_csv(locked_manifest, LOCKED_GEOMETRIC_N20_MANIFEST_PATH)
+  readr::write_csv(annotation_selection_geometric_n20, LOCKED_GEOMETRIC_N20_SELECTION_PATH)
+  readr::write_csv(annotation_selection_geometric_n20, CONFIG_GEOMETRIC_N20_SELECTION_PATH)
+
+  label_df <- pip_keff_prediction %>%
+    dplyr::filter(.data$locus_id %in% LABEL_LOCI | .data$locus_id %in% head(residual_candidates$locus_id, 8L))
+  geometric_label_df <- pip_keff_prediction %>%
+    dplyr::filter(.data$geometric_sample_selected)
+  residual_geometry_label_df <- pip_keff_prediction %>%
+    dplyr::filter(.data$residual_geometry_sample_selected)
+
+  p_pred_actual <- ggplot(
+    pip_keff_prediction,
+    aes(x = .data$log1p_predicted_pip_k_eff_cv, y = .data$log1p_pip_k_eff, color = .data$residual_zone)
+  ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey45") +
+    geom_point(aes(size = .data$max_pip), alpha = 0.78) +
+    geom_point(
+      data = pip_keff_prediction %>% dplyr::filter(.data$geometric_sample_selected),
+      shape = 21,
+      fill = "#FFD166",
+      color = "black",
+      size = 3.2,
+      stroke = 0.75,
+      inherit.aes = FALSE,
+      aes(x = .data$log1p_predicted_pip_k_eff_cv, y = .data$log1p_pip_k_eff)
+    ) +
+    geom_text(
+      data = label_df,
+      aes(label = .data$locus_id),
+      size = 3,
+      nudge_y = 0.04,
+      check_overlap = TRUE
+    ) +
+    labs(
+      title = "Predicted vs actual baseline SuSiE PIP effective size",
+      subtitle = sprintf(
+        "5-fold CV; Spearman rho = %.2f; positive residual = more diffuse than expected",
+        prediction_summary$cv_spearman_actual_predicted[[1]]
+      ),
+      x = "log1p(predicted pip_k_eff from dataset metrics)",
+      y = "log1p(actual baseline SuSiE pip_k_eff)",
+      color = "Residual zone",
+      size = "max PIP"
+    ) +
+    theme(legend.position = "bottom")
+
+  p_geometric_sample <- ggplot(
+    pip_keff_prediction,
+    aes(x = .data$log1p_predicted_pip_k_eff_cv, y = .data$log1p_pip_k_eff)
+  ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey45") +
+    geom_point(color = "grey78", alpha = 0.55, size = 1.8) +
+    geom_point(
+      data = pip_keff_prediction %>% dplyr::filter(.data$geometric_sample_selected),
+      aes(fill = .data$suggested_sampling_region, size = .data$max_pip),
+      shape = 21,
+      color = "black",
+      stroke = 0.9,
+      alpha = 0.95
+    ) +
+    geom_text(
+      data = geometric_label_df,
+      aes(label = .data$geometric_sample_order),
+      size = 2.8,
+      color = "black"
+    ) +
+    labs(
+      title = sprintf("Geometric maximin-repulsion sample of %d loci", GEOMETRIC_SAMPLE_N),
+      subtitle = "Selection uses only the plotted predicted-vs-actual coordinates; region labels are diagnostic only.",
+      x = "log1p(predicted pip_k_eff from dataset metrics)",
+      y = "log1p(actual baseline SuSiE pip_k_eff)",
+      fill = "Diagnostic region",
+      size = "max PIP"
+    ) +
+    theme(legend.position = "bottom")
+
+  p_residual_geometry_sample <- ggplot(
+    pip_keff_prediction,
+    aes(x = .data$log1p_predicted_pip_k_eff_cv, y = .data$log1p_pip_k_eff)
+  ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey45") +
+    geom_point(color = "grey78", alpha = 0.55, size = 1.8) +
+    geom_point(
+      data = pip_keff_prediction %>% dplyr::filter(.data$residual_geometry_sample_selected),
+      aes(fill = .data$suggested_sampling_region, size = .data$max_pip),
+      shape = 21,
+      color = "black",
+      stroke = 0.9,
+      alpha = 0.95
+    ) +
+    geom_text(
+      data = residual_geometry_label_df,
+      aes(label = .data$residual_geometry_sample_order),
+      size = 2.8,
+      color = "black"
+    ) +
+    labs(
+      title = sprintf("Residual-geometry maximin sample of %d loci", GEOMETRIC_SAMPLE_N),
+      subtitle = "Selection uses predicted diffuseness and residual diffuseness; plotted back on predicted vs actual axes.",
+      x = "log1p(predicted pip_k_eff from dataset metrics)",
+      y = "log1p(actual baseline SuSiE pip_k_eff)",
+      fill = "Diagnostic region",
+      size = "max PIP"
+    ) +
+    theme(legend.position = "bottom")
+
+  p_residual <- ggplot(
+    pip_keff_prediction,
+    aes(x = .data$log1p_predicted_pip_k_eff_cv, y = .data$log_pip_k_eff_residual, color = .data$signal_pip_zone)
+  ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey45") +
+    geom_point(aes(size = .data$max_pip), alpha = 0.78) +
+    geom_text(
+      data = label_df,
+      aes(label = .data$locus_id),
+      size = 3,
+      nudge_y = 0.04,
+      check_overlap = TRUE
+    ) +
+    labs(
+      title = "PIP effective-size residuals vs predicted diffuseness",
+      x = "log1p(predicted pip_k_eff from dataset metrics)",
+      y = "log1p(actual pip_k_eff) - log1p(predicted pip_k_eff)",
+      color = "Signal/PIP zone",
+      size = "max PIP"
+    ) +
+    theme(legend.position = "bottom")
+
+  p_residual_hist <- ggplot(pip_keff_prediction, aes(x = .data$log_pip_k_eff_residual, fill = .data$residual_zone)) +
+    geom_histogram(bins = 35, color = "white", linewidth = 0.2) +
+    labs(
+      title = "Prediction residual distribution for PIP effective size",
+      x = "log residual",
+      y = "Locus count",
+      fill = "Residual zone"
+    ) +
+    theme(legend.position = "bottom")
+
+  ggsave(file.path(FIGURE_DIR, "pip_k_eff_predicted_vs_actual.png"), p_pred_actual, width = 8, height = 6, dpi = 150)
+  ggsave(file.path(FIGURE_DIR, "pip_k_eff_geometric_sample_n20.png"), p_geometric_sample, width = 9, height = 7, dpi = 150)
+  ggsave(file.path(FIGURE_DIR, "pip_k_eff_residual_geometry_sample_n20.png"), p_residual_geometry_sample, width = 9, height = 7, dpi = 150)
+  ggsave(file.path(FIGURE_DIR, "pip_k_eff_residual_vs_predicted.png"), p_residual, width = 8, height = 6, dpi = 150)
+  ggsave(file.path(FIGURE_DIR, "pip_k_eff_prediction_residual_histogram.png"), p_residual_hist, width = 8, height = 6, dpi = 150)
+
+  list(
+    prediction_summary = prediction_summary,
+    predictor_columns = pip_keff_predictor_cols,
+    geometric_sample_comparison_counts = geometric_sample_comparison_counts,
+    geometric_sample_counts = geometric_sample_counts,
+    geometric_sample_preview = geometric_sample %>% dplyr::slice_head(n = 20),
+    residual_geometry_sample_counts = residual_geometry_sample_counts,
+    residual_geometry_sample_preview = residual_geometry_sample %>% dplyr::slice_head(n = 20),
+    residual_candidate_preview = residual_candidates %>% dplyr::slice_head(n = 15)
+  )
+  p_pred_actual
+  p_geometric_sample
+  p_residual_geometry_sample
+  p_residual
+  p_residual_hist
+} else {
+  message("Skipping pip_k_eff prediction: need at least 20 complete loci and 2 usable predictors.")
+}
+```
+
+# 9. Zone Diagnostics
+
+```{r zone-plots, fig.width=14, fig.height=4.5}
+plot_df <- joined_metrics %>%
+  dplyr::filter(.data$qc_status == "qc_pass", .data$status == "completed")
+
+make_zone_plot <- function(x_col, y_col, title) {
+  if (!all(c(x_col, y_col) %in% names(plot_df))) {
+    return(
+      ggplot() +
+        annotate("text", x = 0, y = 0, label = paste("Missing columns for", title)) +
+        theme_void()
+    )
+  }
+  p <- ggplot(plot_df, aes(x = .data[[x_col]], y = .data[[y_col]], color = .data$signal_pip_zone)) +
+    geom_point(alpha = 0.8, size = 2) +
+    label_loci_layer(plot_df, x_col, y_col) +
+    labs(title = title, x = x_col, y = y_col, color = "Zone") +
+    theme(legend.position = "bottom")
+  if (identical(y_col, "max_pip")) {
+    p <- p + geom_hline(yintercept = PIP_HIGH_THRESHOLD, linetype = "dashed", color = "grey45")
+  }
+  if (identical(x_col, "z_max_abs")) {
+    p <- p + geom_vline(xintercept = Z_HIGH_THRESHOLD, linetype = "dashed", color = "grey45")
+  }
+  p
+}
+
+p_zone_1 <- make_zone_plot("z_max_abs", "max_pip", "Marginal signal vs max PIP")
+p_zone_2 <- make_zone_plot("z_eff_signals_for_sampling", "pip_k_eff", "z effective signals vs PIP effective size")
+p_zone_3 <- make_zone_plot("M1", "max_pip", "LD mid-energy vs max PIP")
+
+p_zone_1
+p_zone_2
+p_zone_3
+
+ggsave(file.path(FIGURE_DIR, "zone_z_max_abs_vs_max_pip.png"), p_zone_1, width = 8, height = 6, dpi = 150)
+ggsave(file.path(FIGURE_DIR, "zone_z_eff_signals_vs_pip_k_eff.png"), p_zone_2, width = 8, height = 6, dpi = 150)
+ggsave(file.path(FIGURE_DIR, "zone_M1_vs_max_pip.png"), p_zone_3, width = 8, height = 6, dpi = 150)
+```
+
+# 10. Loci of Interest
+
+```{r loci-of-interest}
+joined_metrics %>%
+  dplyr::filter(.data$locus_id %in% LABEL_LOCI) %>%
+  dplyr::select(dplyr::any_of(c(
+    "locus_id", "gene_name", "qc_status", "status",
+    "M1", "M2", "M4",
+    "z_max_abs", "z_topk_ratio", "z_eff_signals",
+    "max_pip", "n_pip_gt_0_5", "n_pip_gt_0_9",
+    "pip_k_eff", "pip_top2_gap",
+    "n_active_effects",
+    "median_active_alpha_k_eff_core95",
+    "signal_pip_zone"
+  )))
+```

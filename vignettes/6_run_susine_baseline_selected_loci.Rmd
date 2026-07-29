@@ -1,0 +1,515 @@
+---
+title: "6. Run Baseline SuSiNE RSS on Selected Loci"
+output: html_notebook
+---
+
+```{r setup}
+required_packages <- c(
+  "arrow", "devtools", "dplyr", "ggplot2", "patchwork", "readr", "tibble", "tidyr", "purrr"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(arrow)
+library(devtools)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(tibble)
+library(tidyr)
+library(purrr)
+
+find_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  candidates <- unique(c(
+    current,
+    dirname(current),
+    dirname(dirname(current)),
+    # Example fallback path -- set to your environment.
+    "/path/to/eQTL_annotations_for_susine"
+  ))
+
+  for (candidate in candidates) {
+    if (
+      dir.exists(file.path(candidate, "utils")) &&
+      dir.exists(file.path(candidate, "vignettes")) &&
+      file.exists(file.path(candidate, "README.md"))
+    ) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate eQTL_annotations_for_susine project root")
+}
+
+resolve_selection_path <- function(project_root) {
+  selection_dir <- file.path(project_root, "output", "prelim", "phase1_metrics_screening_review")
+  candidates <- sort(list.files(
+    selection_dir,
+    pattern = "representative_gene_sample_n.*_annotation_selection\\.csv$",
+    full.names = TRUE
+  ))
+  if (length(candidates) == 0) {
+    stop("Could not find a selected-loci annotation selection CSV under ", selection_dir)
+  }
+  candidates[[length(candidates)]]
+}
+
+merge_manifest_selection <- function(manifest_df, selection_df) {
+  merged_df <- manifest_df %>%
+    inner_join(selection_df, by = "locus_id", suffix = c("_manifest", "_selection"))
+
+  for (field in c("gene_name", "gene_id", "gtex_tissue", "gtex_chrom", "priority", "notes")) {
+    manifest_col <- paste0(field, "_manifest")
+    selection_col <- paste0(field, "_selection")
+    if (manifest_col %in% names(merged_df) && selection_col %in% names(merged_df)) {
+      merged_df[[field]] <- dplyr::coalesce(merged_df[[selection_col]], merged_df[[manifest_col]])
+    } else if (selection_col %in% names(merged_df)) {
+      merged_df[[field]] <- merged_df[[selection_col]]
+    } else if (manifest_col %in% names(merged_df)) {
+      merged_df[[field]] <- merged_df[[manifest_col]]
+    }
+  }
+
+  merged_df
+}
+
+build_dense_ld <- function(ld_long_df, p) {
+  R <- matrix(0, nrow = p, ncol = p)
+  diag(R) <- 1
+  idx1 <- ld_long_df$snp_index_1 + 1L
+  idx2 <- ld_long_df$snp_index_2 + 1L
+  R[cbind(idx1, idx2)] <- ld_long_df$r
+  R[cbind(idx2, idx1)] <- ld_long_df$r
+  R
+}
+
+rms <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NA_real_)
+  sqrt(mean(x^2))
+}
+
+approx_mode <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NA_real_)
+  if (length(unique(x)) == 1) return(x[[1]])
+  hist_obj <- hist(x, breaks = pretty(range(x), n = 40), plot = FALSE)
+  max_bin <- which.max(hist_obj$counts)
+  mean(hist_obj$breaks[c(max_bin, max_bin + 1)])
+}
+
+summarise_distribution <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (!length(x)) {
+    return(tibble(
+      mean = NA_real_,
+      median = NA_real_,
+      mode = NA_real_,
+      q25 = NA_real_,
+      q75 = NA_real_,
+      q90 = NA_real_,
+      q95 = NA_real_,
+      variance = NA_real_
+    ))
+  }
+  qs <- stats::quantile(x, probs = c(0.25, 0.75, 0.9, 0.95), na.rm = TRUE, names = FALSE)
+  tibble(
+    mean = mean(x),
+    median = median(x),
+    mode = approx_mode(x),
+    q25 = qs[[1]],
+    q75 = qs[[2]],
+    q90 = qs[[3]],
+    q95 = qs[[4]],
+    variance = stats::var(x)
+  )
+}
+
+extract_beta_hat_diagnostics <- function(fit, fit_log) {
+  if (!is.null(fit$beta_hat_diagnostics) && nrow(as.data.frame(fit$beta_hat_diagnostics)) > 0) {
+    return(as_tibble(fit$beta_hat_diagnostics))
+  }
+  if (!is.null(fit$model_fit$beta_hat_diagnostics) && nrow(as.data.frame(fit$model_fit$beta_hat_diagnostics)) > 0) {
+    return(as_tibble(fit$model_fit$beta_hat_diagnostics))
+  }
+
+  beta_lines <- grep("^\\[beta_hat\\]", fit_log, value = TRUE)
+  if (!length(beta_lines)) {
+    return(tibble())
+  }
+
+  parse_line <- function(line) {
+    pattern <- paste0(
+      "^\\[beta_hat\\] iter=([0-9]+) effect=([0-9]+) ",
+      "mean=([-0-9.eE]+) median=([-0-9.eE]+) mode=([-0-9.eE]+) ",
+      "q25=([-0-9.eE]+) q75=([-0-9.eE]+) q90=([-0-9.eE]+) q95=([-0-9.eE]+) var=([-0-9.eE]+)$"
+    )
+    m <- regexec(pattern, line)
+    parts <- regmatches(line, m)[[1]]
+    if (length(parts) != 11) {
+      return(NULL)
+    }
+    tibble(
+      iteration = as.integer(parts[[2]]),
+      effect = as.integer(parts[[3]]),
+      mean = as.numeric(parts[[4]]),
+      median = as.numeric(parts[[5]]),
+      mode = as.numeric(parts[[6]]),
+      q25 = as.numeric(parts[[7]]),
+      q75 = as.numeric(parts[[8]]),
+      q90 = as.numeric(parts[[9]]),
+      q95 = as.numeric(parts[[10]]),
+      variance = as.numeric(parts[[11]])
+    )
+  }
+
+  parsed <- purrr::map(beta_lines, parse_line)
+  parsed <- parsed[!vapply(parsed, is.null, logical(1))]
+  if (!length(parsed)) tibble() else bind_rows(parsed)
+}
+
+transform_annotation <- function(q, boundary_eps = 1e-4, winsor_limit = 2.5) {
+  q <- as.numeric(q)
+  q_star <- pmin(pmax(q, -1 + boundary_eps), 1 - boundary_eps)
+  a_raw <- stats::qnorm((q_star + 1) / 2)
+  a_clip <- pmin(pmax(a_raw, -winsor_limit), winsor_limit)
+  a_rms <- rms(a_clip)
+  a <- if (!is.finite(a_rms) || a_rms == 0) rep(0, length(a_clip)) else a_clip / a_rms
+  tibble(q_star = q_star, a_raw = a_raw, a_clip = a_clip, a = a, a_rms = a_rms)
+}
+
+PROJECT_ROOT <- find_project_root()
+WORK_ROOT <- normalizePath(file.path(PROJECT_ROOT, "..", ".."), winslash = "/", mustWork = TRUE)
+SUSINE_REPO <- file.path(WORK_ROOT, "SuSiNE - 2.0", "susine")
+if (!dir.exists(SUSINE_REPO)) {
+  stop("Could not locate susine repo at ", SUSINE_REPO)
+}
+
+devtools::load_all(SUSINE_REPO, quiet = TRUE)
+library(susine)
+
+MANIFEST_PATH <- file.path(PROJECT_ROOT, "config", "loci_manifest_sample_100_per_chrom.csv")
+SELECTION_PATH <- resolve_selection_path(PROJECT_ROOT)
+SELECTION_NAME <- tools::file_path_sans_ext(basename(SELECTION_PATH))
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+LD_DIR <- file.path(OUTPUT_DIR, "ld")
+ANNOTATION_DIR <- file.path(OUTPUT_DIR, "annotation", "alphagenome")
+STEP5_DIR <- file.path(OUTPUT_DIR, "susine_mu0", SELECTION_NAME)
+STEP6_DIR <- file.path(OUTPUT_DIR, "susine_baseline_validation", SELECTION_NAME)
+dir.create(STEP6_DIR, recursive = TRUE, showWarnings = FALSE)
+
+BASELINE_SUMMARY_PATH <- file.path(STEP5_DIR, "mu0_locus_summary.csv")
+if (!file.exists(BASELINE_SUMMARY_PATH)) {
+  stop("Step 5 baseline summary not found: ", BASELINE_SUMMARY_PATH)
+}
+
+SUSINE_L <- 10
+SUSINE_SIGMA_0_2 <- 0.2
+SUSINE_MAX_ITER <- 100
+SUSINE_TOL <- 1e-5
+
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("susine repo:", SUSINE_REPO, "\n")
+cat("Step 5 dir:", STEP5_DIR, "\n")
+cat("Step 6 dir:", STEP6_DIR, "\n")
+```
+
+## Scope
+
+This workbook runs one baseline `susine::susine_rss()` model per selected locus using:
+
+- Phase 1 `z`, `R`, and `n`
+- the baseline per-locus annotation scale `baseline_c_l` from Step 5
+- `mu_0 = baseline_c_l * a`
+
+It captures the in-model beta-hat diagnostics printed during fitting and compares those diagnostics to the external beta-hat and baseline-annotation distributions built from the same summary inputs.
+
+```{r load-selection}
+manifest_df <- readr::read_csv(MANIFEST_PATH, show_col_types = FALSE)
+selection_df <- readr::read_csv(SELECTION_PATH, show_col_types = FALSE)
+baseline_summary_df <- readr::read_csv(BASELINE_SUMMARY_PATH, show_col_types = FALSE)
+
+selected_loci_df <- merge_manifest_selection(manifest_df, selection_df) %>%
+  distinct(locus_id, .keep_all = TRUE) %>%
+  inner_join(
+    baseline_summary_df %>% select(locus_id, baseline_c_l),
+    by = "locus_id"
+  )
+
+if ("priority" %in% names(selected_loci_df)) {
+  selected_loci_df <- selected_loci_df %>% arrange(priority, locus_id)
+} else {
+  selected_loci_df <- selected_loci_df %>% arrange(locus_id)
+}
+
+selected_loci_df %>%
+  select(any_of(c("locus_id", "gene_name", "priority", "baseline_c_l")))
+```
+
+```{r run-baseline-validation}
+run_rows <- list()
+external_rows <- list()
+internal_rows <- list()
+compare_rows <- list()
+error_rows <- list()
+
+for (i in seq_len(nrow(selected_loci_df))) {
+  locus_row <- selected_loci_df[i, ]
+  locus_id <- locus_row$locus_id[[1]]
+  gene_name <- locus_row$gene_name[[1]]
+  baseline_c_l <- as.numeric(locus_row$baseline_c_l[[1]])
+
+  locus_dir <- file.path(LD_DIR, locus_id)
+  annotation_locus_dir <- file.path(ANNOTATION_DIR, locus_id)
+  master_path <- file.path(locus_dir, sprintf("%s_phase1_master_variants.csv", gene_name))
+  order_path <- file.path(locus_dir, sprintf("%s_LD_variant_order.tsv", gene_name))
+  ld_long_path <- file.path(locus_dir, sprintf("%s_phase1_LD_R_long.parquet", gene_name))
+  annotation_path <- file.path(annotation_locus_dir, sprintf("%s_alphagenome_filtered_scores.parquet", gene_name))
+
+  cat(sprintf("[%d/%d] %s (%s)\n", i, nrow(selected_loci_df), locus_id, gene_name))
+
+  missing_paths <- c(
+    if (!file.exists(master_path)) master_path,
+    if (!file.exists(order_path)) order_path,
+    if (!file.exists(ld_long_path)) ld_long_path,
+    if (!file.exists(annotation_path)) annotation_path
+  )
+  if (length(missing_paths) > 0) {
+    error_rows[[length(error_rows) + 1L]] <- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      status = "missing_inputs",
+      error_message = paste(missing_paths, collapse = " | ")
+    )
+    next
+  }
+
+  tryCatch({
+    master_df <- readr::read_csv(master_path, show_col_types = FALSE) %>%
+      filter(.data$ld_included) %>%
+      transmute(
+        variant_id,
+        z_score,
+        slope,
+        slope_se,
+        sample_size
+      )
+
+    order_df <- readr::read_tsv(order_path, show_col_types = FALSE) %>%
+      arrange(.data$index)
+
+    annotation_df <- arrow::read_parquet(annotation_path) %>%
+      as_tibble() %>%
+      group_by(.data$source_variant_id) %>%
+      summarise(
+        quantile_score = mean(.data$quantile_score, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    aligned_df <- order_df %>%
+      left_join(master_df, by = c("id" = "variant_id")) %>%
+      left_join(annotation_df, by = c("id" = "source_variant_id")) %>%
+      arrange(.data$index) %>%
+      mutate(
+        quantile_score = if_else(is.na(.data$quantile_score), 0, .data$quantile_score)
+      ) %>%
+      bind_cols(transform_annotation(.$quantile_score)) %>%
+      mutate(
+        adj = (.data$sample_size - 1) / (.data$z_score^2 + .data$sample_size - 2),
+        beta_hat_std = sqrt(.data$adj) * .data$z_score / sqrt(.data$sample_size - 1),
+        baseline_mu0_l = baseline_c_l * .data$a
+      )
+
+    if (any(is.na(aligned_df$z_score))) {
+      stop("Aligned z_score vector contains NA values.")
+    }
+    if (!all(aligned_df$index == (seq_len(nrow(aligned_df)) - 1L))) {
+      stop("LD order index is not contiguous from 0 to p-1.")
+    }
+
+    ld_long_df <- arrow::read_parquet(ld_long_path) %>% as_tibble()
+    p <- nrow(aligned_df)
+    R <- build_dense_ld(ld_long_df, p)
+
+    if (max(abs(R - t(R))) > 1e-8) {
+      stop("Reconstructed LD matrix is not symmetric within tolerance.")
+    }
+    if (max(abs(diag(R) - 1)) > 1e-8) {
+      stop("Reconstructed LD matrix diagonal is not all ones within tolerance.")
+    }
+
+    n_rss <- round(mean(aligned_df$sample_size, na.rm = TRUE))
+
+    external_beta_stats <- summarise_distribution(aligned_df$beta_hat_std) %>%
+      rename_with(~ paste0("external_beta_hat_", .x))
+    external_mu0_stats <- summarise_distribution(aligned_df$baseline_mu0_l) %>%
+      rename_with(~ paste0("external_mu0_", .x))
+
+    external_rows[[length(external_rows) + 1L]] <- bind_cols(
+      tibble(
+        locus_id = locus_id,
+        gene_name = gene_name,
+        baseline_c_l = baseline_c_l,
+        n_variants = p,
+        n_rss = n_rss
+      ),
+      external_beta_stats,
+      external_mu0_stats
+    )
+
+    fit_log <- capture.output({
+      fit <- susine::susine_rss(
+        L = SUSINE_L,
+        z = aligned_df$z_score,
+        R = R,
+        n = n_rss,
+        mu_0 = baseline_c_l * aligned_df$a,
+        sigma_0_2 = SUSINE_SIGMA_0_2,
+        prior_update_method = "none",
+        max_iter = SUSINE_MAX_ITER,
+        tol = SUSINE_TOL,
+        verbose = TRUE,
+        verbose_beta_hat = TRUE,
+        record_beta_hat_diagnostics = TRUE
+      )
+    })
+
+    writeLines(fit_log, file.path(STEP6_DIR, sprintf("%s_%s_beta_hat_diagnostics.log", gene_name, locus_id)))
+
+    diag_df <- extract_beta_hat_diagnostics(fit, fit_log) %>%
+      mutate(
+        locus_id = locus_id,
+        gene_name = gene_name,
+        baseline_c_l = baseline_c_l
+      ) %>%
+      relocate(.data$locus_id, .data$gene_name, .data$iteration, .data$effect)
+
+    if (nrow(diag_df) == 0) {
+      stop("No beta_hat diagnostics were returned or parsed from the fit log.")
+    }
+
+    internal_rows[[length(internal_rows) + 1L]] <- diag_df
+
+    final_iter <- max(diag_df$iteration, na.rm = TRUE)
+    final_diag_df <- diag_df %>%
+      filter(.data$iteration == !!final_iter) %>%
+      rename_with(~ paste0("internal_beta_hat_", .x), c(mean, median, mode, q25, q75, q90, q95, variance)) %>%
+      mutate(final_iteration = final_iter)
+
+    compare_rows[[length(compare_rows) + 1L]] <- final_diag_df %>%
+      left_join(external_rows[[length(external_rows)]], by = c("locus_id", "gene_name", "baseline_c_l"))
+
+    run_rows[[length(run_rows) + 1L]] <- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      baseline_c_l = baseline_c_l,
+      n_variants = p,
+      n_rss = n_rss,
+      elbo_last = tail(fit$model_fit$elbo, 1),
+      sigma_2_last = tail(fit$model_fit$sigma_2, 1),
+      cs_count = length(fit$model_fit$PIPs[fit$model_fit$PIPs > 0]),
+      max_pip = max(fit$model_fit$PIPs, na.rm = TRUE),
+      final_iteration = final_iter,
+      status = "completed",
+      error_message = NA_character_
+    )
+  }, error = function(e) {
+    error_rows[[length(error_rows) + 1L]] <<- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      baseline_c_l = baseline_c_l,
+      status = "failed",
+      error_message = conditionMessage(e)
+    )
+  })
+}
+
+baseline_run_summary_df <- bind_rows(run_rows)
+external_expected_df <- bind_rows(external_rows)
+internal_beta_hat_diagnostics_df <- bind_rows(internal_rows)
+internal_vs_external_final_df <- bind_rows(compare_rows)
+baseline_errors_df <- bind_rows(error_rows)
+
+write_csv(baseline_run_summary_df, file.path(STEP6_DIR, "baseline_susine_run_summary.csv"))
+write_csv(external_expected_df, file.path(STEP6_DIR, "baseline_external_expected_summary.csv"))
+write_csv(internal_beta_hat_diagnostics_df, file.path(STEP6_DIR, "baseline_internal_beta_hat_diagnostics.csv"))
+write_csv(internal_vs_external_final_df, file.path(STEP6_DIR, "baseline_internal_vs_external_final_iteration.csv"))
+write_csv(baseline_errors_df, file.path(STEP6_DIR, "baseline_susine_errors.csv"))
+
+baseline_run_summary_df
+```
+
+## External expected distributions
+
+```{r external-summary}
+external_expected_df
+```
+
+## Internal beta-hat diagnostics from the fitted model
+
+```{r internal-summary}
+internal_beta_hat_diagnostics_df %>%
+  arrange(.data$locus_id, .data$iteration, .data$effect)
+```
+
+## Final-iteration comparison: external expectation vs in-model beta_hat
+
+```{r compare-summary}
+internal_vs_external_final_df %>%
+  arrange(.data$locus_id, .data$effect)
+```
+
+## Failed loci
+
+```{r failed-loci}
+baseline_errors_df
+```
+
+## Comparison plots
+
+```{r plots, fig.width=11, fig.height=7}
+mean_plot <- internal_vs_external_final_df %>%
+  ggplot(aes(x = .data$external_beta_hat_mean, y = .data$internal_beta_hat_mean, color = factor(.data$effect))) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#444444") +
+  facet_wrap(~ locus_id, scales = "free") +
+  labs(
+    title = "Final in-model beta_hat mean vs external expected beta_hat mean",
+    x = "External beta_hat_std mean",
+    y = "Internal beta_hat mean",
+    color = "Effect"
+  ) +
+  theme_minimal(base_size = 12)
+
+q95_plot <- internal_vs_external_final_df %>%
+  ggplot(aes(x = .data$external_beta_hat_q95, y = .data$internal_beta_hat_q95, color = factor(.data$effect))) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#444444") +
+  facet_wrap(~ locus_id, scales = "free") +
+  labs(
+    title = "Final in-model beta_hat q95 vs external expected beta_hat q95",
+    x = "External beta_hat_std q95",
+    y = "Internal beta_hat q95",
+    color = "Effect"
+  ) +
+  theme_minimal(base_size = 12)
+
+mean_plot / q95_plot
+```
+
+## Notes
+
+- This workbook uses the per-locus baseline `baseline_c_l` from Step 5 and does not pool scales across loci.
+- The model is run with `verbose_beta_hat = TRUE` and `record_beta_hat_diagnostics = TRUE`.
+- Console diagnostics are also written to one log file per locus under `output/susine_baseline_validation/<selection_name>/`.

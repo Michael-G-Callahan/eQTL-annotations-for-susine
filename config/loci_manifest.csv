@@ -1,0 +1,2 @@
+locus_id,gene_name,gene_id,gtex_tissue,gtex_chrom,reference_genome,maf_min,maf_max,min_sample_size,alphagenome_sequence_length,alphagenome_target_data_source,alphagenome_target_gtex_tissue,alphagenome_batch_size,alphagenome_max_workers,alphagenome_retry_wait_seconds,enabled
+CBX8_lung,CBX8,ENSG00000141570.11,Lung,chr17,hg38,0.01,0.99,50,1MB,gtex,Lung,100,8,5,TRUE

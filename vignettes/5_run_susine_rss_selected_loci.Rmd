@@ -1,0 +1,402 @@
+---
+title: "5. Run Vanilla SuSiE RSS on Selected Loci"
+output: html_notebook
+---
+
+```{r setup}
+required_packages <- c("arrow", "dplyr", "ggplot2", "patchwork", "readr", "susieR", "tibble", "tidyr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(susieR)
+library(tibble)
+library(tidyr)
+
+find_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  # Last entry is an example fallback path -- set to your environment.
+  candidates <- unique(c(current, dirname(current), dirname(dirname(current)),
+                         "/path/to/eQTL_annotations_for_susine"))
+
+  for (candidate in candidates) {
+    if (
+      dir.exists(file.path(candidate, "utils")) &&
+      dir.exists(file.path(candidate, "vignettes")) &&
+      file.exists(file.path(candidate, "README.md"))
+    ) {
+      return(candidate)
+    }
+  }
+
+  stop("Could not locate eQTL_annotations_for_susine project root")
+}
+
+resolve_selection_path <- function(project_root) {
+  selection_dir <- file.path(project_root, "output", "prelim", "phase1_metrics_screening_review")
+  candidates <- sort(list.files(
+    selection_dir,
+    pattern = "representative_gene_sample_n.*_annotation_selection\\.csv$",
+    full.names = TRUE
+  ))
+  if (length(candidates) == 0) {
+    stop("Could not find a selected-loci annotation selection CSV under ", selection_dir)
+  }
+  candidates[[length(candidates)]]
+}
+
+merge_manifest_selection <- function(manifest_df, selection_df) {
+  if (!"locus_id" %in% names(manifest_df) || !"locus_id" %in% names(selection_df)) {
+    stop("Both manifest and selection files must include a locus_id column.")
+  }
+
+  merged_df <- manifest_df %>%
+    inner_join(selection_df, by = "locus_id", suffix = c("_manifest", "_selection"))
+
+  for (field in c("gene_name", "gene_id", "gtex_tissue", "gtex_chrom", "priority", "notes")) {
+    manifest_col <- paste0(field, "_manifest")
+    selection_col <- paste0(field, "_selection")
+    if (manifest_col %in% names(merged_df) && selection_col %in% names(merged_df)) {
+      merged_df[[field]] <- dplyr::coalesce(merged_df[[selection_col]], merged_df[[manifest_col]])
+    } else if (selection_col %in% names(merged_df)) {
+      merged_df[[field]] <- merged_df[[selection_col]]
+    } else if (manifest_col %in% names(merged_df)) {
+      merged_df[[field]] <- merged_df[[manifest_col]]
+    }
+  }
+
+  merged_df
+}
+
+build_dense_ld <- function(ld_long_df, p) {
+  R <- matrix(0, nrow = p, ncol = p)
+  diag(R) <- 1
+  idx1 <- ld_long_df$snp_index_1 + 1L
+  idx2 <- ld_long_df$snp_index_2 + 1L
+  R[cbind(idx1, idx2)] <- ld_long_df$r
+  R[cbind(idx2, idx1)] <- ld_long_df$r
+  R
+}
+
+compute_posterior_bhat <- function(susie_fit) {
+  if (is.null(susie_fit$alpha) || is.null(susie_fit$mu)) {
+    stop("susie_fit is missing alpha or mu; could not compute posterior b_hat.")
+  }
+  colSums(susie_fit$alpha * susie_fit$mu)
+}
+
+PROJECT_ROOT <- find_project_root()
+MANIFEST_PATH <- file.path(PROJECT_ROOT, "config", "loci_manifest_sample_100_per_chrom.csv")
+SELECTION_PATH <- resolve_selection_path(PROJECT_ROOT)
+OUTPUT_DIR <- file.path(PROJECT_ROOT, "output")
+LD_DIR <- file.path(OUTPUT_DIR, "ld")
+REVIEW_DIR <- file.path(OUTPUT_DIR, "susie_rss", tools::file_path_sans_ext(basename(SELECTION_PATH)))
+dir.create(REVIEW_DIR, recursive = TRUE, showWarnings = FALSE)
+
+SUSIE_L <- 10
+ESTIMATE_RESIDUAL_VARIANCE <- TRUE
+CHECK_PRIOR <- FALSE
+
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("Manifest:", MANIFEST_PATH, "\n")
+cat("Selection:", SELECTION_PATH, "\n")
+cat("Review dir:", REVIEW_DIR, "\n")
+```
+
+## Scope
+
+This notebook runs vanilla `susieR::susie_rss()` on every selected locus using the stored Phase 1:
+
+- `z_score` values from each locus master variant file
+- LD order TSV
+- long-form LD parquet
+
+No additional data prep is needed as long as those three artifacts exist and the LD matrix reconstructs cleanly.
+
+```{r load-selection}
+manifest_df <- readr::read_csv(MANIFEST_PATH, show_col_types = FALSE)
+selection_df <- readr::read_csv(SELECTION_PATH, show_col_types = FALSE)
+selected_loci_df <- merge_manifest_selection(manifest_df, selection_df) %>%
+  distinct(locus_id, .keep_all = TRUE)
+
+if ("priority" %in% names(selected_loci_df)) {
+  selected_loci_df <- selected_loci_df %>% arrange(priority, locus_id)
+} else {
+  selected_loci_df <- selected_loci_df %>% arrange(locus_id)
+}
+
+selected_loci_df %>%
+  select(any_of(c("locus_id", "gene_name", "gtex_tissue", "gtex_chrom", "priority", "notes")))
+```
+
+```{r run-susie}
+run_rows <- list()
+bhat_rows <- list()
+top_rows <- list()
+error_rows <- list()
+run_summary_cols <- c(
+  "locus_id", "gene_name", "n_variants", "n_rss", "elbo_last",
+  "cs_count", "max_pip", "mean_abs_bhat", "max_abs_bhat",
+  "status", "error_message"
+)
+
+for (i in seq_len(nrow(selected_loci_df))) {
+  locus_row <- selected_loci_df[i, ]
+  locus_id <- locus_row$locus_id[[1]]
+  gene_name <- locus_row$gene_name[[1]]
+
+  locus_dir <- file.path(LD_DIR, locus_id)
+  master_path <- file.path(locus_dir, sprintf("%s_phase1_master_variants.csv", gene_name))
+  order_path <- file.path(locus_dir, sprintf("%s_LD_variant_order.tsv", gene_name))
+  ld_long_path <- file.path(locus_dir, sprintf("%s_phase1_LD_R_long.parquet", gene_name))
+
+  cat(sprintf("[%d/%d] %s (%s)\n", i, nrow(selected_loci_df), locus_id, gene_name))
+
+  if (!file.exists(master_path) || !file.exists(order_path) || !file.exists(ld_long_path)) {
+    error_rows[[length(error_rows) + 1L]] <- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      status = "missing_inputs",
+      error_message = paste(
+        c(
+          if (!file.exists(master_path)) master_path,
+          if (!file.exists(order_path)) order_path,
+          if (!file.exists(ld_long_path)) ld_long_path
+        ),
+        collapse = " | "
+      )
+    )
+    next
+  }
+
+  tryCatch({
+    master_df <- readr::read_csv(master_path, show_col_types = FALSE) %>%
+      filter(.data$ld_included) %>%
+      transmute(
+        variant_id,
+        z_score,
+        slope,
+        slope_se,
+        sample_size,
+        ld_matrix_index
+      )
+
+    order_df <- readr::read_tsv(order_path, show_col_types = FALSE)
+    ld_long_df <- arrow::read_parquet(ld_long_path) %>% as_tibble()
+
+    aligned_df <- order_df %>%
+      left_join(master_df, by = c("id" = "variant_id")) %>%
+      arrange(.data$index)
+
+    if (any(is.na(aligned_df$z_score))) {
+      stop("Aligned z_score vector contains NA values.")
+    }
+
+    expected_index <- seq_len(nrow(aligned_df)) - 1L
+    if (!all(aligned_df$index == expected_index)) {
+      stop("LD order index is not contiguous from 0 to p-1.")
+    }
+
+    p <- nrow(aligned_df)
+    R <- build_dense_ld(ld_long_df, p)
+
+    if (max(abs(R - t(R))) > 1e-8) {
+      stop("Reconstructed LD matrix is not symmetric within tolerance.")
+    }
+    if (max(abs(diag(R) - 1)) > 1e-8) {
+      stop("Reconstructed LD matrix diagonal is not all ones within tolerance.")
+    }
+
+    n_rss <- round(mean(aligned_df$sample_size, na.rm = TRUE))
+    susie_fit <- susieR::susie_rss(
+      z = aligned_df$z_score,
+      R = R,
+      n = n_rss,
+      L = SUSIE_L,
+      estimate_residual_variance = ESTIMATE_RESIDUAL_VARIANCE,
+      check_prior = CHECK_PRIOR
+    )
+
+    posterior_bhat <- compute_posterior_bhat(susie_fit)
+
+    locus_bhat_df <- aligned_df %>%
+      transmute(
+        locus_id = locus_id,
+        gene_name = gene_name,
+        variant_id = id,
+        z_score,
+        slope,
+        slope_se,
+        sample_size,
+        posterior_bhat = posterior_bhat,
+        pip = susie_fit$pip
+      )
+
+    top10_df <- locus_bhat_df %>%
+      arrange(desc(abs(.data$posterior_bhat))) %>%
+      mutate(rank_abs_bhat = row_number()) %>%
+      slice_head(n = 10)
+
+    run_rows[[length(run_rows) + 1L]] <- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      n_variants = p,
+      n_rss = n_rss,
+      elbo_last = tail(susie_fit$elbo, 1),
+      cs_count = length(susie_fit$sets$cs),
+      max_pip = max(susie_fit$pip, na.rm = TRUE),
+      mean_abs_bhat = mean(abs(posterior_bhat), na.rm = TRUE),
+      max_abs_bhat = max(abs(posterior_bhat), na.rm = TRUE),
+      status = "completed",
+      error_message = NA_character_
+    )
+
+    bhat_rows[[length(bhat_rows) + 1L]] <- locus_bhat_df
+    top_rows[[length(top_rows) + 1L]] <- top10_df
+  }, error = function(e) {
+    error_rows[[length(error_rows) + 1L]] <<- tibble(
+      locus_id = locus_id,
+      gene_name = gene_name,
+      status = "failed",
+      error_message = conditionMessage(e)
+    )
+  })
+}
+
+susie_run_summary_df <- bind_rows(run_rows)
+susie_errors_df <- bind_rows(error_rows)
+posterior_bhat_df <- bind_rows(bhat_rows)
+top10_bhat_df <- bind_rows(top_rows)
+
+if (nrow(susie_run_summary_df) == 0) {
+  susie_run_summary_df <- tibble(
+    locus_id = character(),
+    gene_name = character(),
+    n_variants = integer(),
+    n_rss = integer(),
+    elbo_last = double(),
+    cs_count = integer(),
+    max_pip = double(),
+    mean_abs_bhat = double(),
+    max_abs_bhat = double(),
+    status = character(),
+    error_message = character()
+  )
+}
+
+if (nrow(susie_errors_df) > 0) {
+  susie_run_summary_df <- bind_rows(
+    susie_run_summary_df,
+    susie_errors_df %>% mutate(
+      n_variants = NA_integer_,
+      n_rss = NA_integer_,
+      elbo_last = NA_real_,
+      cs_count = NA_integer_,
+      max_pip = NA_real_,
+      mean_abs_bhat = NA_real_,
+      max_abs_bhat = NA_real_
+    ) %>% select(all_of(run_summary_cols))
+  )
+}
+
+write_csv(susie_run_summary_df, file.path(REVIEW_DIR, "susie_rss_run_summary.csv"))
+write_csv(posterior_bhat_df, file.path(REVIEW_DIR, "susie_rss_posterior_bhat_table.csv"))
+write_csv(top10_bhat_df, file.path(REVIEW_DIR, "susie_rss_top10_posterior_bhat_per_locus.csv"))
+
+susie_run_summary_df
+```
+
+## Failed loci
+
+```{r failed-loci}
+susie_errors_df
+```
+
+## Posterior `b_hat` distribution across loci
+
+```{r bhat-across-loci, fig.width=12, fig.height=8}
+posterior_bhat_df %>%
+  ggplot(aes(x = posterior_bhat)) +
+  geom_histogram(bins = 40, fill = "#2f6c8f", color = "white") +
+  facet_wrap(~ locus_id, scales = "free_y") +
+  labs(
+    title = "Posterior b_hat distribution across selected loci",
+    x = "Posterior b_hat = colSums(alpha * mu)",
+    y = "Variant count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Top 10 absolute `b_hat` variants per locus
+
+```{r top10-table}
+top10_bhat_df %>%
+  arrange(locus_id, rank_abs_bhat) %>%
+  select(locus_id, gene_name, rank_abs_bhat, variant_id, z_score, slope, slope_se, posterior_bhat, pip)
+```
+
+## Per-locus histograms with top 10 markers
+
+```{r per-locus-hists, fig.width=10, fig.height=6}
+plot_manifest <- list()
+
+for (locus_id in unique(posterior_bhat_df$locus_id)) {
+  locus_bhat_df <- posterior_bhat_df %>% filter(.data$locus_id == !!locus_id)
+  locus_top10_df <- top10_bhat_df %>% filter(.data$locus_id == !!locus_id)
+  if (nrow(locus_bhat_df) == 0) {
+    next
+  }
+
+  gene_name <- unique(locus_bhat_df$gene_name)[[1]]
+
+  p_hist <- ggplot(locus_bhat_df, aes(x = posterior_bhat)) +
+    geom_histogram(bins = 40, fill = "#2f6c8f", color = "white") +
+    geom_vline(
+      data = locus_top10_df,
+      aes(xintercept = posterior_bhat),
+      color = "#b85c38",
+      linetype = "dashed",
+      linewidth = 0.7,
+      alpha = 0.8
+    ) +
+    labs(
+      title = sprintf("%s (%s): posterior b_hat distribution", gene_name, locus_id),
+      x = "Posterior b_hat = colSums(alpha * mu)",
+      y = "Variant count"
+    ) +
+    theme_minimal(base_size = 12)
+
+  # print(p_hist)
+
+  plot_path <- file.path(REVIEW_DIR, sprintf("%s_%s_posterior_bhat_histogram.png", gene_name, locus_id))
+  ggsave(plot_path, p_hist, width = 10, height = 6, dpi = 150)
+  plot_manifest[[length(plot_manifest) + 1L]] <- tibble(
+    locus_id = locus_id,
+    gene_name = gene_name,
+    plot_path = plot_path
+  )
+}
+
+plot_manifest_df <- bind_rows(plot_manifest)
+write_csv(plot_manifest_df, file.path(REVIEW_DIR, "susie_rss_plot_manifest.csv"))
+plot_manifest_df
+```
+
+## Notes
+
+- This workbook runs plain `susie_rss` only. No AlphaGenome or other annotation vector is used here.
+- Posterior `b_hat` is defined here as `colSums(alpha * mu)` from the `susie_rss` fit.
+- If a locus fails here, the most likely causes are:
+  - missing Phase 1 LD artifacts
+  - NA values in `z_score`
+  - malformed or non-symmetric reconstructed LD
