@@ -8,7 +8,9 @@ pysam>=0.22
 # Install from PyPI: pip install alphagenome
 # or from source: https://github.com/google-deepmind/alphagenome
 # Requires an ALPHAGENOME_API_KEY environment variable at runtime.
-alphagenome
+# Pinned: annotation output depends on the client/model version, so an
+# unpinned client would not reproduce the published annotations.
+alphagenome==0.7.0
 # Notebook / plotting extras
 seaborn>=0.12
 tqdm>=4.65
